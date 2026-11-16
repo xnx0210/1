@@ -28,11 +28,13 @@ import {
   POOL_DOUBAO_MODELS_PATH,
   POOL_DOUBAO_QUOTA_PATH,
   POOL_DOUBAO_SESSION_PATH,
+  POOL_DOUBAO_SELECTION_PATH,
 } from './status-paths.ts'
 import { claimTasks, fetchCampaign } from './doubao-campaign.ts'
 import { fetchAccountName } from './doubao-upstream.ts'
 import { fetchLiveModels } from './doubao-catalog-live.ts'
 import { browserLogin, readExistingSession, sessionUsable, type DoubaoSession } from './doubao-auth.ts'
+import { readStoredSkipped, writeStoredSkipped } from './doubao-store.ts'
 import { fetchQuota } from './doubao-quota.ts'
 import { setDoubaoSession } from './doubao-upstream.ts'
 
@@ -194,6 +196,60 @@ export function registerDoubaoRoutes(ctx: Context, deps: DoubaoRouteOptions): vo
           return json(res, 200, {
             ok: false,
             models: [],
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      },
+    })
+
+    /**
+     * The card's model switches, hosted where the PICKER can see them.
+     *
+     * WHY THIS ROUTE EXISTS
+     *
+     * The card used to keep Doubao's selection in its own `localStorage`. That is fine for
+     * drawing checkboxes and wrong for everything else: the HOST's model picker reads the
+     * adapter registry, the adapter runs in the host process, and a browser store is
+     * invisible from there. So switching a model off changed the card and nothing else —
+     * the picker kept listing every model, which is the defect this route closes.
+     *
+     * GET answers the current set (`configured: false` when the user has never saved),
+     * PUT replaces it. Both are needed: the card writes one id per click, and it has to
+     * render the right boxes on reopen.
+     */
+    const disposeSelection = ctx.webServer.register({
+      kind: 'exact',
+      path: POOL_DOUBAO_SELECTION_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!originTrusted(req, deps.trustedHosts?.() ?? [])) return json(res, 403, { error: 'origin-not-trusted' })
+        try {
+          if (req.method === 'GET') {
+            const skipped = await readStoredSkipped()
+            return json(res, 200, {
+              ok: true,
+              // `undefined` and `[]` are different answers: the first is "never configured"
+              // (serve everything), the second is "the user really switched them all off".
+              configured: skipped !== undefined,
+              ids: skipped === undefined ? [] : [...skipped],
+            })
+          }
+          if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' })
+          /**
+           * The body is the COMPLETE set, not a delta.
+           *
+           * The card already holds the authoritative set it just wrote, so sending it whole
+           * keeps this route a plain write and removes the read-modify-write race two
+           * clicks in the same tick would otherwise hit.
+           */
+          const body = await readJson(req)
+          const raw = body['ids']
+          if (!Array.isArray(raw)) return json(res, 400, { error: 'ids must be an array' })
+          const ids = raw.filter((id): id is string => typeof id === 'string' && id !== '')
+          await writeStoredSkipped(ids)
+          return json(res, 200, { ok: true, configured: true, ids })
+        } catch (error: unknown) {
+          return json(res, 200, {
+            ok: false,
             error: error instanceof Error ? error.message : String(error),
           })
         }

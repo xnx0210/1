@@ -202,6 +202,15 @@ export const POOL_DOUBAO_QUOTA_PATH = '/plugins/dsh-xdpool/doubao/quota'
 /** The models the account may use, as the vendor publishes them. */
 export const POOL_DOUBAO_MODELS_PATH = '/plugins/dsh-xdpool/doubao/models'
 
+/**
+ * The card's Doubao model switches, stored where the HOST's picker can read them.
+ *
+ * A browser `localStorage` entry cannot be seen from the host process, and the picker is
+ * rendered from the adapter registry there — so the selection has to cross the wire for a
+ * switch to mean anything outside the card. GET reports the set, PUT replaces it.
+ */
+export const POOL_DOUBAO_SELECTION_PATH = '/plugins/dsh-xdpool/doubao/selection'
+
 /** The account's credit tasks: what is waiting, and what has been collected. */
 export const POOL_DOUBAO_CAMPAIGN_PATH = '/plugins/dsh-xdpool/doubao/campaign'
 

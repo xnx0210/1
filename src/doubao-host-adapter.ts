@@ -39,6 +39,7 @@ import { sessionUsable, type DoubaoSession } from './doubao-auth.ts'
 import { DOUBAO_MODELS, type DoubaoModelInfo } from './doubao-models.ts'
 import { fetchLiveModels } from './doubao-catalog-live.ts'
 import { chat, type DoubaoImage } from './doubao-upstream.ts'
+import { readStoredSkipped, writeStoredSkipped } from './doubao-store.ts'
 
 /** The provider id the picker groups by. */
 export const DOUBAO_PROVIDER_ID = 'doubao'
@@ -89,6 +90,21 @@ export interface DoubaoHostAdapterOptions {
   session: () => DoubaoSession | undefined
   /** Called when the upstream reports its conversation id. */
   onConversationId?: ((id: string) => void) | undefined
+  /**
+   * The model ids the user switched OFF in the card.
+   *
+   * WHY THIS IS A CALLBACK AND NOT A STORED FIELD
+   *
+   * The card writes its selection asynchronously (one POST per click), while the picker
+   * reads the roster on its own schedule. Handing the adapter the CURRENT set on every
+   * call is what makes a click visible without a restart — the alternative, snapshotting
+   * the set at construction, would freeze the first read's answer for the whole session.
+   *
+   * `undefined` means "never configured" and must serve everything; an empty Set means
+   * "the user switched every model off", which is a real state and must be honoured.
+   * The difference is the whole reason this cannot be `?? new Set()`.
+   */
+  skipped?: () => Promise<ReadonlySet<string> | undefined>
 }
 
 /**
@@ -116,7 +132,33 @@ export class DoubaoHostAdapter extends LlmAdapter {
     const session = this.options.session()
     const models = await fetchLiveModels(session)
     this.cached = { at: Date.now(), models }
-    return models.map(model => this.describe(model))
+    /**
+     * Honour the card's model switches.
+     *
+     * Before this, `listModels` returned the account's whole roster and the picker drew
+     * every entry — so switching a model off in the card changed what the GATEWAY
+     * advertised while the picker kept showing all of them (#doubao-selection). The two
+     * faces of one lane have to agree, which is the same defect the WorkBuddy lanes hit
+     * in #121 and fixed through `model-switch-bridge.ts`. Doubao needs its own path
+     * because its selection is not owned by the vendored pack.
+     *
+     * A read failure serves everything rather than nothing: an unreadable selection file
+     * is not evidence that the user switched every model off, and blanking the picker
+     * would read as a broken channel.
+     */
+    const skipped = await this.readSkipped()
+    if (skipped === undefined) return models.map(model => this.describe(model))
+    return models.filter(model => !skipped.has(model.id)).map(model => this.describe(model))
+  }
+
+  /** The models the card switched off, or `undefined` when the answer is unknowable. */
+  private async readSkipped(): Promise<ReadonlySet<string> | undefined> {
+    if (this.options.skipped === undefined) return readStoredSkipped()
+    try {
+      return await this.options.skipped()
+    } catch {
+      return undefined
+    }
   }
 
   override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

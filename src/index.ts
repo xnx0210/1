@@ -11,7 +11,7 @@ import { registerDoubaoRoutes } from './doubao-routes.ts'
 import { createDoubaoAutomation } from './doubao-automation.ts'
 import { DoubaoHostAdapter, DOUBAO_PROVIDER_ID } from './doubao-host-adapter.ts'
 import { DOUBAO_MODELS } from './doubao-catalog.ts'
-import { readStoredSession, removeStoredSession, writeStoredSession } from './doubao-store.ts'
+import { readStoredSkipped, readStoredSession, removeStoredSession, writeStoredSession } from './doubao-store.ts'
 import { setDoubaoSession } from './doubao-upstream.ts'
 import type { DoubaoSession } from './doubao-auth.ts'
 import { dirname, join } from 'node:path'
@@ -1258,6 +1258,14 @@ function canonicalJson(value: unknown): string {
 
   const doubaoLlm = createDoubaoLlm({
     session: () => doubaoSession,
+    /**
+     * The same selection the host adapter filters against.
+     *
+     * ONE source for both faces: this lane feeds the gateway's `/v1/models`, the adapter
+     * feeds the local picker, and a switch that reached only one of them would leave the
+     * other advertising a model the user had turned off.
+     */
+    skipped: () => readStoredSkipped(),
   })
 
   /**
@@ -2148,7 +2156,17 @@ function canonicalJson(value: unknown): string {
            */
           releaseAdapterDoubao = ctx.llm.registerAdapter(
             [DOUBAO_PROVIDER_ID],
-            new DoubaoHostAdapter({ session: () => doubaoSession }),
+            new DoubaoHostAdapter({
+              session: () => doubaoSession,
+              /**
+               * Read the card's selection from disk on every roster read.
+               *
+               * A callback rather than a value: the card writes one POST per click and the
+               * picker redraws on its own schedule, so a snapshot taken here would freeze
+               * the first read for the rest of the session.
+               */
+              skipped: () => readStoredSkipped(),
+            }),
           )
         } catch (error: unknown) {
           // An adapter that cannot be created is not survivable — the picker

@@ -60,6 +60,7 @@ import {
   POOL_DOUBAO_CLAIM_PATH,
   POOL_DOUBAO_MODELS_PATH,
   POOL_DOUBAO_QUOTA_PATH,
+  POOL_DOUBAO_SELECTION_PATH,
   POOL_DOUBAO_SESSION_PATH,
 } from '../status-paths.ts'
 // The DATA module, not `doubao-llm.ts`: the latter reaches `node:fs`/`node:child_process`
@@ -139,6 +140,29 @@ async function saveDoubaoSkipped(modelId: string, disabled: boolean): Promise<vo
   if (disabled) next.add(modelId)
   else next.delete(modelId)
   globalThis.localStorage?.setItem(DOUBAO_SKIP_KEY, JSON.stringify([...next]))
+  /**
+   * Mirror the new set to the host.
+   *
+   * `localStorage` is invisible from the host process, and the model PICKER is rendered
+   * from the adapter registry there — so a switch kept only in the browser changed this
+   * card and nothing else. The route stores it where `DoubaoHostAdapter.listModels` can
+   * filter against it.
+   *
+   * A failed write is NOT rethrown: the checkbox already moved, the local store already
+   * holds the answer, and the next click will send the whole set again. Surfacing a
+   * transient sync error here would roll the box back for a state the card can still
+   * honour.
+   */
+  try {
+    await fetch(POOL_DOUBAO_SELECTION_PATH, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [...next] }),
+    })
+  } catch {
+    // See above: the local store is authoritative for this render.
+  }
 }
 
 /** What is stored per channel: counts, not accounts. */

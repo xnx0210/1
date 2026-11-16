@@ -89,6 +89,20 @@ export interface DoubaoLlmOptions {
   session: () => DoubaoSession | undefined
   /** Called once the upstream reports its own conversation id, so the next turn continues it. */
   onConversationId?: ((id: string) => void) | undefined
+  /**
+   * The model ids the card switched off, read per call.
+   *
+   * THE SECOND HALF OF #doubao-selection. The card's selection used to live only in the
+   * browser, so neither of the two host paths that publish Doubao's roster could see it:
+   * `DoubaoHostAdapter.listModels` (which the local picker reads) AND this lane (which the
+   * OpenAI gateway's `/v1/models` reads). Filtering only the adapter left the gateway
+   * advertising every model, and filtering only the gateway leaves the picker showing them.
+   * Both read this same set.
+   *
+   * `undefined` means "never configured" (serve everything); an empty Set means the user
+   * switched every model off, which is a real state and must be honoured.
+   */
+  skipped?: () => Promise<ReadonlySet<string> | undefined>
 }
 
 /** The two methods `channel-lane` calls. */
@@ -117,7 +131,24 @@ export function createDoubaoLlm(options: DoubaoLlmOptions): DoubaoLlm {
        * third-party models Doubao publishes per plan, instead of a fixed list that was short.
        */
       const live = await fetchLiveModels(options.session())
-      return live.map(model => ({
+      /**
+       * Honour the card's model switches.
+       *
+       * This is the roster the OpenAI gateway advertises, so a model the user switched off
+       * must disappear HERE as well as from the local picker — otherwise the two faces of
+       * this lane disagree, which is exactly the defect #doubao-selection reports.
+       *
+       * A read failure serves everything: an unreadable selection is not evidence that the
+       * user disabled all of them, and an empty gateway is worse than a wider one.
+       */
+      let skipped: ReadonlySet<string> | undefined
+      try {
+        skipped = options.skipped === undefined ? undefined : await options.skipped()
+      } catch {
+        skipped = undefined
+      }
+      const shown = skipped === undefined ? live : live.filter(model => !skipped.has(model.id))
+      return shown.map(model => ({
         id: model.id,
         name: model.name,
         ...(model.badge === undefined ? {} : { description: model.badge }),
