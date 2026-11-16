@@ -42,3 +42,9 @@ _backup-lib-*/
 # future patches will use; the notes file is listed so nobody re-adds it either.
 pack.js.patched-local-*.bak
 FIX-*-NOTES.md
+
+# The vendored pack bundle: a BUILD ARTIFACT of another repository that embeds
+# upstream OAuth defaults GitHub's push protection refuses. Excluded from this
+# fork's history; vendor/channel-pack/NOTICE.md documents reconstruction. Kept
+# on disk so pnpm build and an installed plugin keep working.
+vendor/channel-pack/pack.js
