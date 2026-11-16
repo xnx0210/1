@@ -34,7 +34,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { ReactNode } from 'react'
 import type { XdPoolSettingsKey } from './locales.ts'
 import { SHARED_CARD_CSS, SHELL_CSS } from './styles.ts'
-import { COMMUNITY_QR_QQ, COMMUNITY_QR_WECHAT } from './community-qr.ts'
 /** The translator the settings section injects. */
 type Translate = (key: XdPoolSettingsKey, params?: Record<string, unknown>) => string
 /** One page in the tab strip. `num` renders the OFM-style corner count. */
@@ -155,24 +154,6 @@ export function PoolShell({
 }: PoolShellProps) {
   /** Measured box of the active tab's button, in tab-strip coordinates. */
   const [glider, setGlider] = useState<{ left: number; top: number; width: number; height: number } | undefined>(undefined)
-  /** Whether the group-invite dialog is open. Local: nothing outside needs it. */
-  const [groupOpen, setGroupOpen] = useState(false)
-  /**
-   * Close the dialog on Escape.
-   *
-   * The overlay's own click handler covers the pointer, but a keyboard user who
-   * opened this with Enter has no other way out — and a modal with no key exit
-   * is a trap. Bound only while open, so the listener is not paid for on every
-   * page of a card that is mostly not showing a dialog.
-   */
-  useEffect(() => {
-    if (!groupOpen) return undefined
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setGroupOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('keydown', onKey) }
-  }, [groupOpen])
   const tabRefs = useRef(new Map<string, HTMLButtonElement | null>())
   const tabsRef = useRef<HTMLDivElement | null>(null)
   const measure = useCallback((): void => {
@@ -231,9 +212,15 @@ export function PoolShell({
             </span>
           </span>
         </div>
+        {/*
+          Points at THIS build's repository, not upstream's. The upstream star link sent
+          readers to a project that does not contain the Doubao fix or the removed group
+          invite, so a user following it would look for behaviour that is not there.
+          Provenance is stated in README.FORK.md instead.
+        */}
         <a
           className="dsm-xdpool-star"
-          href="https://github.com/XDTrees/dsh-xdpool"
+          href="https://github.com/xnx0210/1"
           target="_blank"
           rel="noreferrer"
           title={t?.('shell.starHint') ?? 'Open this plugin on GitHub'}
@@ -247,34 +234,16 @@ export function PoolShell({
           <span>{t?.('shell.star') ?? 'Star on GitHub'}</span>
         </a>
         {/*
-          The group invite, next to the star and in the same slot.
-          
-          A `<button>`, not an `<a>`: this opens a dialog in place. Sending the
-          user to an external page to look at a picture is worse than showing
-          the picture — a WeChat group code has to be scanned from the screen
-          it is displayed on, and a new tab steals focus from the very device
-          doing the scanning.
+          The community-group button that used to sit here has been removed in this
+          build. It opened a dialog with the upstream author's WeChat bot code and QQ
+          group code — invitations to somebody else's groups, which do not belong in a
+          fork that is only carrying a bug fix.
+
+          Removing the button alone would leave the dialog unreachable but still
+          compiled into the bundle, and `community-qr.ts` inlines both codes as data
+          URIs, so the pictures would ship anyway. The import, the state and the
+          dialog markup are therefore gone too.
         */}
-        <button
-          type="button"
-          className="dsm-xdpool-star dsm-xdpool-group"
-          title={t?.('shell.groupHint') ?? '扫码加入 XD 交流群'}
-          onClick={() => { setGroupOpen(true) }}
-        >
-          <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            {/* Two overlapping speech bubbles: the WeChat-group read at 15px,
-                without copying the trademark's exact silhouette. */}
-            <path
-              fill="currentColor"
-              d="M9.1 3.4c-3.6 0-6.5 2.4-6.5 5.4 0 1.7 1 3.2 2.6 4.2l-.7 2.1 2.4-1.2c.7.2 1.4.3 2.2.3h.4a5.6 5.6 0 0 1-.2-1.5c0-3 2.9-5.4 6.5-5.4h.5C15.7 5.1 12.7 3.4 9.1 3.4zm-2.3 2.9a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8zm4.6 0a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8z"
-            />
-            <path
-              fill="currentColor"
-              d="M21.4 12.7c0-2.5-2.4-4.5-5.4-4.5s-5.4 2-5.4 4.5 2.4 4.5 5.4 4.5c.6 0 1.2-.1 1.8-.2l2 1-.6-1.7c1.4-.9 2.2-2.2 2.2-3.6zm-7.2-1.4a.8.8 0 1 1 0 1.6.8.8 0 0 1 0-1.6zm3.6 0a.8.8 0 1 1 0 1.6.8.8 0 0 1 0-1.6z"
-            />
-          </svg>
-          <span>{t?.('shell.group') ?? '交流群'}</span>
-        </button>
         <div className="dsm-xdpool-navtabs" role="tablist" ref={tabsRef}>
           {glider === undefined ? null
             : <span
@@ -302,95 +271,11 @@ export function PoolShell({
         </div>
       </nav>
       {/*
-        The group invite, expanded IN PLACE under the tab strip.
-
-        History of getting this wrong twice:
-
-        1. `position:absolute; inset:0` against `.dsm-xdpool-shell` — but the shell is
-           a column of every panel on the page, so the overlay spanned the page's whole
-           scroll height and `align-items:center` put the dialog half-way down it.
-        2. `position:fixed` centred in the viewport — technically a correct modal, but
-           not what was asked for: the reader wanted the codes to appear WHERE the
-           button sits, not as a scrim over everything.
-
-        So it is now a normal flow element directly under the nav: no overlay, no
-        centring, nothing to scroll past. Opening it pushes the panels below down by
-        its own height, which is the behaviour of every other disclosure on this card
-        and the only one that puts the answer next to the question.
+        The community-group dialog that used to render here is gone in this
+        build. It showed the upstream author's WeChat bot code and QQ group
+        code, which are invitations to somebody else's groups and do not belong
+        in a fork that carries nothing but a bug fix.
       */}
-      {!groupOpen ? null : (
-        <div
-          className="dsm-xdpool-groupinline"
-          role="dialog"
-          aria-modal="false"
-          aria-label={t?.('shell.groupTitle') ?? 'XD 交流群'}
-        >
-          <div className="dsm-xdpool-groupcard">
-            <div className="dsm-xdpool-groupcardhead">
-              <b>{t?.('shell.groupTitle') ?? 'XD 交流群'}</b>
-              <button
-                type="button"
-                className="dsm-xdpool-groupclose"
-                aria-label={t?.('shell.groupClose') ?? '关闭'}
-                onClick={() => { setGroupOpen(false) }}
-              >
-                ×
-              </button>
-            </div>
-            {/*
-              Two codes, side by side, because they are joined in two different
-              ways and one caption cannot describe both:
-
-                - WeChat is a BOT's personal code: scanning only adds the bot,
-                  and the user must then send `XD` before being pulled in. A
-                  reader who scans and waits sees nothing happen, so the step is
-                  printed right under that code rather than in a footnote.
-                - QQ is the group's own code: scanning IS joining.
-
-              `alt` carries the instruction rather than a description: a screen
-              reader user cannot scan a code, so "what to do" is the only useful
-              thing to say. The design is column-flowing so the panel stays one
-              dialog on a narrow settings pane instead of two stacked screens.
-            */}
-            <div className="dsm-xdpool-groupcodes">
-              <div className="dsm-xdpool-groupcode">
-                <img
-                  className="dsm-xdpool-groupqr"
-                  src={COMMUNITY_QR_WECHAT}
-                  alt={t?.('shell.groupWechatAlt') ?? '微信机器人二维码：扫码添加后发送 XD，即可被拉进群'}
-                  width={220}
-                  height={220}
-                />
-                <span className="dsm-xdpool-groupcode-label">
-                  {t?.('shell.groupWechat') ?? '微信（机器人）'}
-                </span>
-                <span className="dsm-xdpool-groupcode-step">
-                  {t?.('shell.groupWechatStep') ?? '扫码添加机器人后，发送「XD」拉你进群'}
-                </span>
-              </div>
-              <div className="dsm-xdpool-groupcode">
-                <img
-                  className="dsm-xdpool-groupqr"
-                  src={COMMUNITY_QR_QQ}
-                  alt={t?.('shell.groupQqAlt') ?? 'QQ 群二维码：直接扫码加入 XD 交流群'}
-                  width={220}
-                  height={220}
-                />
-                <span className="dsm-xdpool-groupcode-label">
-                  {t?.('shell.groupQq') ?? 'QQ 群'}
-                </span>
-                <span className="dsm-xdpool-groupcode-step">
-                  {t?.('shell.groupQqStep') ?? '直接扫码即可加入'}
-                </span>
-              </div>
-            </div>
-            <p className="dsm-xdpool-groupnote">
-              {t?.('shell.groupNote')
-                ?? '两个群都在；哪个方便用哪个。二维码失效了在 GitHub 提 issue 说一声，会更新。'}
-            </p>
-          </div>
-        </div>
-      )}
       {hero === undefined ? null : hero}
       <div className="dsm-xdpool-body">{children}</div>
     </div>
