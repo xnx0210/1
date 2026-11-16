@@ -1,0 +1,2537 @@
+/**
+ * Account pool: discovers every WorkBuddy credential snapshot the desktop app
+ * has left on this machine and hands out one healthy account per request,
+ * rotating away from any account the upstream has rate-limited.
+ *
+ * Discovery is read-only: the desktop app's files are never written. Each
+ * account is keyed by its billing identity (`uin`, falling back to `uid`), so
+ * re-logging the same account refreshes in place instead of creating a duplicate.
+ *
+ * @module dsh-xdpool/accounts
+ */
+
+import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { readFile, readdir, unlink } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
+import { regionOf, type WorkBuddyRegion } from './upstream.ts'
+import { accountStorePath, isStateFile, loadStoredAccounts, saveStoredAccounts, snapshotDirPath } from './account-store.ts'
+import {
+  encryptedFieldKeyId,
+  isEncryptedFieldWrapper,
+  openEncryptedField,
+  readAtRestKey,
+  atRestKeyFor,
+} from './at-rest.ts'
+
+/** Minimal upstream surface the pool needs to refresh a token (no circular import). */
+export interface TokenRefresher {
+  refreshToken(credential: WorkBuddyCredential): Promise<{
+    accessToken: string
+    refreshToken?: string
+    expiresInSec?: number
+    domain?: string
+  }>
+}
+
+/**
+ * Minimal billing surface the pool needs to fill `creditExpiry` itself.
+ *
+ * Declared here for the same reason as {@link TokenRefresher}: the pool knows
+ * about accounts, not about HTTP, and importing `WorkBuddyUpstreamClient` would
+ * make the two modules circular. `fetchCredits` is OPTIONAL so every existing
+ * `TokenRefresher` — the test stubs, and any host that only wired token refresh
+ * — keeps working untouched; a client without it simply warms nothing.
+ */
+export interface CreditReader {
+  fetchCredits(credential: WorkBuddyCredential, signal?: AbortSignal): Promise<{
+    total: number
+    /** Absent (or undefined) when no one-off pack has a deadline. */
+    nearestExpiryMs?: number | undefined
+  }>
+}
+
+/**
+ * What the pool knows about one account's one-off pack deadlines.
+ *
+ * The three `state`s are the whole point of the B+ fix: "never asked", "asked,
+ * nothing has a deadline" and "asked, here is the deadline" need different
+ * handling, and collapsing them into one absent-key predicate is what made a
+ * pure monthly-pack account be re-read forever (S1 in
+ * `EXPIRY-ADVERSARIAL-20261111.md`). `stale` is orthogonal: the reading is real
+ * but older than {@link EXPIRY_READING_TTL_MS}, so it describes the past.
+ */
+export interface ExpiryReading {
+  state: 'unread' | 'none' | 'at'
+  /** Deadline, epoch ms; present exactly when `state === 'at'`. */
+  at?: number
+  /** When this reading was written, epoch ms; absent for `unread`. */
+  readAtMs?: number
+  /** True when the reading is older than {@link EXPIRY_READING_TTL_MS}. */
+  stale: boolean
+}
+
+/** Live auth file name the WorkBuddy desktop app writes. */
+export const WORKBUDDY_LIVE_FILENAME = 'workbuddy-desktop.info'
+
+/** Snapshot files left behind by previous logins share this prefix. */
+
+/** Env override for the auth file or its directory. */
+export const WORKBUDDY_AUTH_FILE_ENV = 'WORKBUDDY_AUTH_FILE'
+
+/** One parsed WorkBuddy credential. */
+/**
+ * A credential file the pool could not turn into an account.
+ *
+ * Reported (not swallowed) because the count is otherwise a lie: a directory
+ * holding four files that yields two accounts looks like two accounts were
+ * deleted, when in fact two files were unreadable. Naming the file and the
+ * reason is what makes the difference visible.
+ */
+export interface WorkBuddySkippedFile {
+  path: string
+  reason: 'encrypted' | 'expired' | 'unreadable' | 'malformed'
+}
+
+export interface WorkBuddyCredential {
+  accessToken: string
+  refreshToken: string
+  expiresAtMs: number
+  refreshExpiresAtMs?: number
+  /**
+   * When the upstream says it issued this token (`auth.lastRefreshTime`).
+   *
+   * This, not `expiresAtMs`, is the reliable freshness signal: the upstream
+   * never rewrites a stored expiry when it revokes a token, so a long-dead
+   * backup can claim to expire later than the token that actually works.
+   * Absent on documents the desktop app did not write (the plugin's own
+   * refreshed copy, older builds).
+   */
+  lastRefreshAtMs?: number
+  nickname?: string
+  uin?: string
+  uid?: string
+  enterpriseId?: string
+  domain: string
+  /** Where this credential came from, for diagnostics. */
+  sourcePath: string
+}
+
+/** An account is a credential plus pool bookkeeping. */
+export interface WorkBuddyAccount {
+  /** Stable pool key: sha256 of the billing identity. */
+  id: string
+  /** Short human label, e.g. `青楫渡` or `青楫渡#29890334`. */
+  label: string
+  credential: WorkBuddyCredential
+  /**
+   * Epoch ms until which this account is skipped for EVERY model. Only set by
+   * account-wide cooldowns (callers that penalize without a model id). The
+   * upstream rate limit is actually per-model ("可切换其他模型继续使用"), so
+   * routine 429s are tracked in {@link modelCooldowns} instead and never ban a
+   * whole account.
+   */
+  cooldownUntilMs: number
+  /**
+   * Per-model cooldowns, keyed by upstream model id → epoch ms until that model
+   * on THIS account is skipped. A 429 on `hy4-preview` cools only that model
+   * here; `hy3`/`glm-*` on the same account keep serving.
+   */
+  modelCooldowns: Record<string, number>
+  /** Consecutive rate-limit hits, for diagnostics. */
+  rateLimitHits: number
+  /**
+   * Epoch ms until which this account is skipped because the upstream REJECTED
+   * its sign-in (401/403), not because of a rate limit.
+   *
+   * A revoked session is invisible from the credential file: the upstream does
+   * not rewrite `expiresAtMs` when it kills a refresh token, so a dead account
+   * looks perfectly fresh and, without this field, gets picked again on the very
+   * next attempt. With `maxAttempts` retries that meant one dead account could
+   * absorb an entire request while healthy accounts were never tried.
+   *
+   * Only a fresh sign-in in the desktop app clears it, so the cooldown is long;
+   * `0`/undefined means "not known to be dead".
+   */
+  credentialDeadUntilMs?: number
+}
+
+function nonEmptyEnv(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
+/**
+ * Platform-default directories holding the desktop app's auth files.
+ * Windows probes Local before Roaming; a redirected profile still resolves
+ * through the env location.
+ */
+export function defaultDesktopAuthDirs(
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (platform === 'darwin') {
+    return [join(home, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth')]
+  }
+  if (platform === 'win32') {
+    const local = nonEmptyEnv(env['LOCALAPPDATA']) ?? join(home, 'AppData', 'Local')
+    const roaming = nonEmptyEnv(env['APPDATA']) ?? join(home, 'AppData', 'Roaming')
+    return [
+      join(local, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+      join(roaming, 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+    ]
+  }
+  if (platform === 'linux') {
+    const config = nonEmptyEnv(env['XDG_CONFIG_HOME']) ?? join(home, '.config')
+    return [join(config, 'CodeBuddyExtension', 'Data', 'Public', 'auth')]
+  }
+  return []
+}
+
+/** Normalize an expiry that may arrive in seconds or milliseconds. */
+function expiryToMs(value: number): number {
+  if (value <= 0) return 0
+  return value > 1e12 ? value : value * 1000
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * Read one string-valued field that may arrive as a plain string (older builds)
+ * or as the desktop app's `$wbEncrypted` envelope. The app started encrypting
+ * `accessToken` / `refreshToken` / `nickname` in 5.6.0 on BOTH macOS and Windows
+ * — the earlier "Windows first" reading was wrong, and it is why a signed-in Mac
+ * showed no account at all: the value is an object, `typeof === 'string'` failed,
+ * and the parser reported "no credential" for a perfectly good sign-in.
+ *
+ * `decrypt` is injected rather than called here so this parser stays synchronous
+ * and testable; the async key fetch lives in `readCredential`. A field that IS
+ * encrypted but could not be opened is reported as `failed` rather than as an
+ * empty string — the caller must tell the user the app is missing or unreachable,
+ * not send them to sign in again (the one action that cannot help).
+ */
+/**
+ * Marker for "the credential is encrypted and we could not obtain the key".
+ *
+ * Carried as a `code` rather than left to `instanceof` because the value crosses
+ * the packaged-plugin boundary; the same convention the sibling error types use.
+ * This is deliberately NOT "not signed in": the user IS signed in, and telling
+ * them to sign in again sends them to the one action that cannot help.
+ */
+export const ENCRYPTED_CREDENTIAL_CODE = 'ENCRYPTED_CREDENTIAL'
+
+export class WorkBuddyEncryptedCredentialError extends Error {
+  readonly code = ENCRYPTED_CREDENTIAL_CODE
+  constructor(sourcePath: string) {
+    super(
+      `workbuddy: ${sourcePath} holds encrypted credentials, but no WorkBuddy desktop app could be located to provide the key.`
+        + ' If the app IS installed, it is simply outside the paths this plugin probes — set '
+        + 'WORKBUDDY_APP_EXECUTABLE to its full .exe path (then restart DSH) and the credential will open.'
+        + ' Signing in again will not help: the credential itself is intact. '
+        + 'Run `dsh-xdpool doctor` to see which paths were probed — if one of them looks like '
+        + 'mojibake (e.g. "??" where a Chinese folder name should be), the registry value could not be '
+        + 'decoded on this machine; report that line and use the override above in the meantime.',
+    )
+    this.name = 'WorkBuddyEncryptedCredentialError'
+  }
+}
+
+/** True when a thrown value is the encrypted-credential marker (cross-bundle safe). */
+export function isEncryptedCredentialError(value: unknown): boolean {
+  return typeof value === 'object' && value !== null
+    && (value as { code?: unknown }).code === ENCRYPTED_CREDENTIAL_CODE
+}
+
+function decryptableString(
+  value: unknown,
+  decrypt: ((field: unknown) => string) | undefined,
+): { value: string; encrypted: boolean; failed: boolean } {
+  if (typeof value === 'string') return { value, encrypted: false, failed: false }
+  if (isEncryptedFieldWrapper(value)) {
+    if (decrypt === undefined) return { value: '', encrypted: true, failed: true }
+    try {
+      return { value: decrypt(value), encrypted: true, failed: false }
+    } catch {
+      return { value: '', encrypted: true, failed: true }
+    }
+  }
+  return { value: '', encrypted: false, failed: false }
+}
+
+/**
+ * Parse a WorkBuddy auth document. Accepts the nested desktop shape
+ * `{"auth":{...},"account":{...}}` and the flat panel shape; returns undefined
+ * when there is no usable access token.
+ *
+ * `decrypt` opens the desktop app's `$wbEncrypted` field wrapper (5.6.0+, both
+ * platforms). Absent means "plain-string builds only", which is what every
+ * caller without an at-rest key should pass.
+ */
+export function parseWorkBuddyAuth(
+  text: string,
+  sourcePath: string,
+  decrypt?: (field: unknown) => string,
+): WorkBuddyCredential | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+
+  let auth: Record<string, unknown>
+  let identity: Record<string, unknown>
+  if (typeof document['auth'] === 'object' && document['auth'] !== null) {
+    auth = document['auth'] as Record<string, unknown>
+    identity =
+      typeof document['account'] === 'object' && document['account'] !== null
+        ? (document['account'] as Record<string, unknown>)
+        : {}
+  } else {
+    auth = document
+    identity = document
+  }
+
+  const accessField = decryptableString(auth['accessToken'], decrypt)
+  // An encrypted-but-unopenable credential must NOT be reported as a readable
+  // one with an empty token: the caller has to distinguish "not signed in" from
+  // "signed in, but the app holding the key is missing".
+  if (accessField.encrypted && accessField.failed) {
+    throw new WorkBuddyEncryptedCredentialError(sourcePath)
+  }
+  const accessToken = accessField.value
+  if (accessToken === '') return undefined
+
+  // Skip documents whose refresh window has already closed: they cannot recover.
+  const refreshExpiresAtMs =
+    typeof auth['refreshExpiresAt'] === 'number' ? expiryToMs(auth['refreshExpiresAt']) : undefined
+  if (refreshExpiresAtMs !== undefined && refreshExpiresAtMs > 0 && refreshExpiresAtMs < Date.now()) {
+    return undefined
+  }
+
+  // The upstream's own issue time, the only signal that stays truthful after a
+  // token is revoked: credential selection prefers it over the stored expiry,
+  // which a dead backup can claim arbitrarily far into the future.
+  const lastRefreshAtMs = typeof auth['lastRefreshTime'] === 'number'
+    ? expiryToMs(auth['lastRefreshTime'])
+    : undefined
+  // Resolved ONCE each, then used twice: the identity fields were written as
+  // `optionalString(…) === undefined ? {} : { uin: optionalString(…) }`, which
+  // ran the parse twice AND defeated the type narrowing — TypeScript narrows the
+  // first call but not the second, so the object literal carried `string | undefined`
+  // into a field declared `?: string`. One const fixes both.
+  const nickname = optionalString(decryptableString(identity['nickname'], decrypt).value)
+  const uin = optionalString(identity['uin'])
+  const uid = optionalString(identity['uid'])
+  const enterpriseId = optionalString(identity['enterpriseId'])
+
+  return {
+    accessToken,
+    refreshToken: decryptableString(auth['refreshToken'], decrypt).value,
+    expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
+    ...refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs },
+    ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
+    ...nickname === undefined ? {} : { nickname },
+    ...uin === undefined ? {} : { uin },
+    ...uid === undefined ? {} : { uid },
+    ...enterpriseId === undefined ? {} : { enterpriseId },
+    domain: typeof auth['domain'] === 'string' ? auth['domain'] : '',
+    sourcePath,
+  }
+}
+
+/**
+ * Stable account id. `uin` is the billing identity the upstream keys on and
+ * survives re-login; `uid` is the fallback.
+ */
+/**
+ * True when `path` is the desktop app's live sign-in (as opposed to a backup
+ * snapshot it left behind). The live file always wins: it is the session the
+ * app itself is using.
+ */
+function isLiveAuthFile(path: string): boolean {
+  return basename(path) === WORKBUDDY_LIVE_FILENAME
+}
+
+/**
+ * True for a credential this plugin minted from the channel-pack sign-in flow.
+ *
+ * `packCredentialToWorkBuddy` stamps `channel-pack:<provider>:<ref>` here, so the
+ * prefix is the only thing distinguishing a scanned credential from a file the
+ * desktop app wrote. Nothing about it is a path on disk — there is no file to
+ * stat and no mtime to read.
+ */
+function isChannelPackSource(path: string): boolean {
+  return path.startsWith('channel-pack:')
+}
+
+/**
+ * Which of two credentials for the same account the pool should keep.
+ *
+ * Ordering, highest first:
+ *
+ * 1. the live file the desktop app is signed in with;
+ * 2. a credential minted by our own channel-pack sign-in;
+ * 3. the credential the upstream issued most recently (`lastRefreshAtMs`);
+ * 4. the longer stored expiry, as a fallback for documents that carry no issue
+ *    time (the plugin's own refreshed copy, older builds).
+ *
+ * The stored expiry alone is NOT a freshness signal: the upstream does not
+ * rewrite it when it revokes a token, so a long-dead backup can claim to expire
+ * later than the token that actually works. Selecting on it made every upstream
+ * call return 401 while a perfectly good credential sat in the same directory.
+ *
+ * Rank 2 exists because a scanned credential loses both of the lower tests by
+ * construction: it is not the live filename, and the sign-in flow records no
+ * `lastRefreshAtMs`. Ranking it below a leftover snapshot meant a user who had
+ * just scanned a fresh sign-in still saw "sign-in was rejected", because the
+ * abandoned file kept winning the comparison and the dead mark was never
+ * cleared. The live file stays on top: that is the session the running desktop
+ * app is genuinely using right now, and it is newer than anything we mint.
+ */
+function compareFreshness(a: WorkBuddyCredential, b: WorkBuddyCredential): number {
+  const rankOf = (credential: WorkBuddyCredential): number => {
+    if (isLiveAuthFile(credential.sourcePath)) return 2
+    if (isChannelPackSource(credential.sourcePath)) return 1
+    return 0
+  }
+  const aRank = rankOf(a)
+  const bRank = rankOf(b)
+  if (aRank !== bRank) return bRank - aRank
+
+  const aIssued = a.lastRefreshAtMs ?? 0
+  const bIssued = b.lastRefreshAtMs ?? 0
+  if (aIssued !== bIssued) return bIssued - aIssued
+
+  return b.expiresAtMs - a.expiresAtMs
+}
+
+/** True when `candidate` should replace `incumbent` for the same account. */
+function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential): boolean {
+  return compareFreshness(candidate, incumbent) < 0
+}
+
+export function workbuddyAccountId(
+  credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname'>,
+): string {
+  const stable = credential.uin ?? credential.uid ?? credential.nickname ?? 'unknown'
+  return createHash('sha256').update(`workbuddy\0${stable}`).digest('hex').slice(0, 16)
+}
+
+/** Human label; distinguishes same-nickname accounts by uid prefix. */
+function accountLabel(credential: WorkBuddyCredential): string {
+  const name = credential.nickname ?? 'WorkBuddy'
+  const discriminator = (credential.uid ?? credential.uin ?? '').slice(0, 8)
+  return discriminator === '' ? name : `${name}#${discriminator}`
+}
+
+/** List the auth files in one directory: the live file plus every snapshot. */
+/**
+ * Credential files in one auth directory, freshest first.
+ *
+ * Every `*.info` file counts, not just the timestamped `workbuddy-desktop.*`
+ * snapshots: the international client signs in as `workbuddy-desktop-ai.info`
+ * (a hyphen, not a dot), so a prefix test silently dropped every global
+ * credential and the global provider then saw an empty pool.
+ *
+ * Filenames are plain strings, and the ordering here is only a first pass —
+ * `isFresher` makes the real call once each file has been parsed.
+ */
+async function authFilesIn(dir: string): Promise<string[]> {
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return []
+  }
+  const files = entries.filter(name => name.endsWith('.info'))
+  // Newest snapshot first so the freshest token wins when uids collide.
+  files.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+  return files.map(name => join(dir, name))
+}
+
+/**
+ * Snapshot files in the plugin data directory that are account snapshots.
+ *
+ * Every `*.info` file there is one (the importer keeps that extension for
+ * uniformity with the auth dirs it copies from); the plugin's own JSON state
+ * files (`accounts.json`, `ignored.json`, `preferred.json`) are NOT and must
+ * never reach the credential parser.
+ */
+export async function snapshotFilesIn(dir: string): Promise<string[]> {
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return []
+  }
+  return entries
+    .filter(name => name.endsWith('.info'))
+    .filter(name => !isStateFile(name))
+    .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+    .map(name => join(dir, name))
+}
+
+/**
+ * One credential file, or undefined when it cannot be used.
+ *
+ * Returns undefined — rather than throwing — for every failure mode, so ONE bad
+ * file cannot empty the pool. That is the whole point: an auth directory blends
+ * plain files, encrypted files, half-written files and files from an app version
+ * this plugin cannot read, and a scan that aborts on the first unusable one
+ * reports "you have 2 accounts" when it means "I could not open the other two".
+ *
+ * The caller surfaces the ones it skipped, so the count never silently
+ * disagrees with what is on disk.
+ */
+async function readCredential(path: string): Promise<WorkBuddyCredential | undefined> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch {
+    return undefined
+  }
+  // Fetch the app's at-rest key once per process, and only when the document
+  // actually carries an encrypted field: plain-string builds must not spawn the
+  // app at all. A missing key leaves `decrypt` undefined, which turns an
+  // encrypted field into a thrown `WorkBuddyEncryptedCredentialError` instead of
+  // a silent "no credential".
+  const decrypt = text.includes('"$wbEncrypted"') ? await encryptedFieldOpener() : undefined
+  try {
+    return parseWorkBuddyAuth(text, path, decrypt)
+  } catch {
+    // Encrypted-but-unopenable, malformed, or an unknown shape: skip THIS file.
+    // Previously this rethrew `WorkBuddyEncryptedCredentialError`, which
+    // propagated out of `scan()` and discarded every account that had parsed
+    // fine — the reported "4 accounts become 2 after switching sign-in".
+    return undefined
+  }
+}
+
+/**
+ * The pool id a document would receive, WITHOUT decrypting anything.
+ *
+ * Used to honour the ignore list before the at-rest key lookup runs: `uin` and
+ * `uid` are read as plain strings by {@link parseWorkBuddyAuth}, while
+ * `nickname` is commonly encrypted — so this returns undefined for an account
+ * whose identity lives only in the encrypted nickname, and the caller falls
+ * back to the full parse for those.
+ */
+export function cheapIdentityId(text: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+  const identity =
+    typeof document['account'] === 'object' && document['account'] !== null
+      ? (document['account'] as Record<string, unknown>)
+      : document
+  const uin = typeof identity['uin'] === 'string' && identity['uin'] !== '' ? identity['uin'] : undefined
+  const uid = typeof identity['uid'] === 'string' && identity['uid'] !== '' ? identity['uid'] : undefined
+  if (uin === undefined && uid === undefined) return undefined
+  // `workbuddyAccountId` reads `uin` first, exactly as the full parse does, so
+  // this cheap id agrees with the id the account would really be filed under.
+  return workbuddyAccountId({ ...uin === undefined ? {} : { uin }, ...uid === undefined ? {} : { uid } })
+}
+
+/** {@link cheapIdentityId} for a file path; undefined when it cannot be read. */
+async function cheapIdentityIdFromFile(path: string): Promise<string | undefined> {
+  try {
+    return cheapIdentityId(await readFile(path, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The `uin` of a credential file, read WITHOUT the expiry gate.
+ *
+ * `parseWorkBuddyAuth` deliberately refuses an expired document, which is exactly the
+ * state this is asked about — so the identity has to come from the raw JSON. `uin` and not
+ * `uid`: `uin` is the billing identity, so two sign-ins of one person match even when the
+ * desktop app wrote them from different installs.
+ */
+async function cheapUinFromFile(path: string): Promise<string | undefined> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+  const identity =
+    typeof document['account'] === 'object' && document['account'] !== null
+      ? (document['account'] as Record<string, unknown>)
+      : document
+  const uin = identity['uin']
+  return typeof uin === 'string' && uin !== '' ? uin : undefined
+}
+
+/**
+ * Why a file could not become an account.
+ *
+ * The distinctions matter because the REMEDIES differ, and a wrong label sends the reader
+ * after a fix that cannot work:
+ *
+ *   - `encrypted`   — the desktop app holds the key; start it, or set the executable
+ *                     override. Actionable.
+ *   - `expired`     — the file IS a credential, correctly formed, whose refresh window has
+ *                     closed. Nothing to fix: sign in again, or delete the snapshot. This
+ *                     used to be reported as `malformed`, which reads as "this file is not
+ *                     a credential" and sends the user looking for a format problem that
+ *                     does not exist — the reported confusion over three 2026-10-08
+ *                     snapshots whose tokens had simply aged out.
+ *   - `unreadable`  — the bytes could not be read at all.
+ *   - `malformed`   — genuine: unparseable, or parseable but not a credential shape.
+ *
+ * `expired` is decided by re-parsing the document the same way `parseWorkBuddyAuth` does,
+ * which is the only way to tell "a credential that aged out" from "not a credential". A
+ * document that parses as JSON but carries no token stays `malformed`: those are three
+ * different facts and collapsing any two of them costs the reader the diagnosis.
+ */
+async function skipReasonFor(path: string): Promise<WorkBuddySkippedFile['reason']> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch {
+    return 'unreadable'
+  }
+  if (text.includes('"$wbEncrypted"')) return 'encrypted'
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return 'malformed'
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return 'malformed'
+  const document = parsed as Record<string, unknown>
+  const auth =
+    typeof document['auth'] === 'object' && document['auth'] !== null
+      ? (document['auth'] as Record<string, unknown>)
+      : document
+  // No token at all: this really is not a credential.
+  const token = auth['accessToken']
+  if (typeof token !== 'string' || token === '') {
+    // An encrypted envelope was already handled above; anything else without a token is
+    // simply not a credential.
+    return 'malformed'
+  }
+  /**
+   * It HAS a token, so the only remaining reason to skip it is a closed refresh window.
+   * Mirrors the guard in `parseWorkBuddyAuth`, and falls back to `malformed` when the
+   * window cannot be read — an unknown expiry is not evidence of expiry.
+   */
+  const refreshRaw = auth['refreshExpiresAt']
+  if (typeof refreshRaw === 'number') {
+    const refreshAt = expiryToMs(refreshRaw)
+    if (refreshAt > 0 && refreshAt < Date.now()) return 'expired'
+  }
+  return 'malformed'
+}
+
+/**
+ * Build the field opener, or undefined when the app cannot supply its key.
+ *
+ * Split out so the key lookup is testable without a real desktop install, and so
+ * a lookup failure degrades to "encrypted, unopenable" rather than to a parse
+ * error that would look like a corrupt file.
+ */
+export async function encryptedFieldOpener(): Promise<((field: unknown) => string) | undefined> {
+  // Warm the per-key-id cache so the synchronous closure below can resolve each
+  // field's own key. Each encrypted field names the key id it was sealed under
+  // (WorkBuddyEncryptedField.envelope.keyId); when more than one desktop build
+  // (domestic and international) is installed on one machine, every build yields
+  // its key here and the field selects its own. A build that fails to answer is
+  // skipped on its own (mirroring the reference provideTheKey), so one bad spawn
+  // cannot hide the others behind a process-wide undefined key.
+  await readAtRestKey().catch(() => undefined)
+  return (field: unknown) => {
+    if (!isEncryptedFieldWrapper(field)) throw new Error('workbuddy: not an encrypted field wrapper')
+    const keyId = encryptedFieldKeyId(field)
+    if (keyId === undefined) throw new Error('workbuddy: encrypted field has no key id')
+    const key = atRestKeyFor(keyId)
+    if (key === undefined) throw new Error('workbuddy: no at-rest key available for this encrypted field')
+    return openEncryptedField(field, key)
+  }
+}
+
+// Warm the key cache for any installed build before the first parse, so a field
+// resolves synchronously inside the opener above. Exposed for tests/diagnostics.
+export async function primeAtRestKeys(): Promise<void> {
+  await readAtRestKey().catch(() => undefined)
+}
+
+/** Every directory the pool should scan, in probe order. */
+export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const dirs: string[] = []
+  const override = nonEmptyEnv(env[WORKBUDDY_AUTH_FILE_ENV])
+  if (override !== undefined) {
+    // The env var may name the file or its directory; accept both.
+    dirs.push(override.toLowerCase().endsWith('.info') ? resolve(override, '..') : override)
+  }
+  dirs.push(...defaultDesktopAuthDirs(process.env['DSH_TEST_PLATFORM'] as NodeJS.Platform | undefined))
+  return dirs
+}
+
+/** How the pool chooses which account serves the next request. */
+export type AccountDistribution = 'priority' | 'round-robin' | 'balanced' | 'sticky' | 'expiry'
+
+/**
+ * How many conversation→account bindings `sticky` mode remembers.
+ *
+ * Only a memory bound: evicting the oldest binding costs one re-pick on that
+ * conversation's next turn, it never loses an account or a request.
+ */
+const STICKY_AFFINITY_LIMIT = 200
+
+export interface AccountPoolOptions {
+  /**
+   * File the `sticky` bindings are remembered in, or undefined for memory only.
+   *
+   * The card promises one account per conversation, and that promise used to end
+   * at the process boundary: every restart re-picked, so one session could be
+   * served by three different accounts in a day and pay full prompt cost each
+   * time. The caller passes the plugin's own state path; tests pass a temp file.
+   */
+  affinityPath?: string
+  /** Logger for discovery and rotation events. */
+  logger?: { info?(...args: unknown[]): void; warn(...args: unknown[]): void; error?(...args: unknown[]): void }
+  /** Override the directories scanned (tests). */
+  authDirs?: readonly string[]
+  /** How long a rate-limited account stays out of rotation. */
+  cooldownMs?: number
+  /** How long an account rests after its credits run out (default 30 minutes). */
+  exhaustCooldownMs?: number
+  /**
+   * How long an account rests after the upstream rejects its sign-in
+   * (default 30 minutes). Only a fresh sign-in in the desktop app clears it.
+   */
+  credentialDeadCooldownMs?: number
+  /** Upstream client used to refresh near-expiry tokens. */
+  client?: TokenRefresher & Partial<CreditReader>
+  /** Refresh this long before actual expiry; default five minutes. */
+  refreshMarginMs?: number
+  /**
+   * How long a credit-pack deadline reading is trusted, in ms.
+   *
+   * Defaults to {@link EXPIRY_READING_TTL_MS}; overridable so a test can age a
+   * reading without sleeping for an hour.
+   */
+  expiryReadingTtlMs?: number
+  /**
+   * How requests are spread across the pool.
+   *
+   * - `priority` (default): one account serves every request until it is
+   *   rate-limited, then the next in order takes over. Credits drain one
+   *   account at a time, and a cooled account resumes at the head of the
+   *   queue the moment its window resets.
+   * - `round-robin`: consecutive requests rotate through the pool so the
+   *   spend spreads evenly.
+   * - `sticky`: one account per conversation, and a new conversation moves to
+   *   the next account in order. Keeps the upstream prompt cache warm inside a
+   *   conversation while still spreading spend across conversations.
+   * - `expiry`: the account whose one-off credit packs expire soonest serves
+   *   first, so use-it-or-lose-it credits are spent before they die. Accounts
+   *   with no known expiry sort last, so a pool that has never been probed
+   *   behaves like `priority`.
+   */
+  distribution?: AccountDistribution
+  /**
+   * Enable the durable account store.
+   *
+   * When on, `scan()` seeds its merge from `~/.dsh/.xdpool/accounts.json` and
+   * writes the merged list back, so accounts gathered by switching desktop
+   * sign-ins survive a restart, and the plugin's snapshot directory becomes a
+   * scan source.
+   *
+   * DEFAULT OFF, on purpose: the 70+ existing pool tests build fixtures over
+   * temp auth dirs, and a store that wrote by default would flush those
+   * fixtures into the user's real `~/.dsh/.xdpool/accounts.json`. Production
+   * assembles the pool through `createCore()`, which passes `persistent: true`;
+   * tests opt in explicitly.
+   */
+  persistent?: boolean
+}
+
+/**
+ * Read-only pool of every discovered WorkBuddy account, with rate-limit
+ * cooldown and round-robin failover.
+ */
+/** Idle bonus per hour an account has been unused (reference-panel default). */
+const IDLE_WEIGHT_PER_HOUR = 0.5
+/** Ceiling for the idle bonus, so an idle account cannot dominate forever. */
+const IDLE_WEIGHT_MAX = 5
+
+/**
+ * Weight one account by how long it has been idle.
+ *
+ * The base of 1 keeps every eligible account in play: an account that served a
+ * moment ago still has a small chance, so a single unhealthy account cannot pin
+ * the pool to itself, and the weights never sum to zero.
+ *
+ * `lastUsedAt === undefined` means "never used in this process", which earns the
+ * full bonus: on a fresh start every account ties, and the weighted draw spreads
+ * the first requests instead of always picking the first entry.
+ */
+function idleWeight(lastUsedAt: number | undefined, now: number): number {
+  if (lastUsedAt === undefined) return 1 + IDLE_WEIGHT_MAX
+  const hours = (now - lastUsedAt) / 3_600_000
+  // A clock jump backwards would produce a negative idle term; clamp to 0.
+  const idle = Math.min(Math.max(hours, 0) * IDLE_WEIGHT_PER_HOUR, IDLE_WEIGHT_MAX)
+  return 1 + idle
+}
+
+/** Default rest for an account whose credits ran out (packs reset on their own schedule). */
+const EXHAUST_COOLDOWN_MS = 30 * 60 * 1000
+
+/**
+ * Default rest for an account the upstream rejected the sign-in of (401/403).
+ *
+ * Unlike a rate limit there is no reset time to read: only signing in again in
+ * the desktop app revives the account. The rest is therefore long enough that a
+ * single request never burns its whole retry budget on the same dead credential,
+ * but short enough that a user who just signed in is not locked out of their own
+ * account for long — and a newer credential file clears the mark outright.
+ */
+const CREDENTIAL_DEAD_COOLDOWN_MS = 30 * 60 * 1000
+
+/**
+ * How long a credit-pack deadline reading stays trusted, in ms.
+ *
+ * The deadline is not a constant of the account: packs get spent, and the
+ * "nearest expiry" moves to the next pack when the soonest one dies. A reading
+ * is therefore a snapshot of the past, and `expiry` mode sorting on a stale one
+ * spends the wrong account. An hour is short enough to track a normal day of
+ * spending and long enough that the request path — which refreshes a balance at
+ * most every ten minutes, and only for the accounts that actually serve — can
+ * keep it current without a timer of its own.
+ */
+export const EXPIRY_READING_TTL_MS = 3_600_000
+
+/**
+ * Shortest gap between two attempts at the same account's deadline reading.
+ *
+ * Only failed attempts are actually throttled by this: a successful read stamps
+ * the reading itself, so {@link EXPIRY_READING_TTL_MS} takes over from there.
+ */
+const EXPIRY_WARM_RETRY_MS = 60_000
+
+/**
+ * Does this refresh failure prove the credential itself is dead?
+ *
+ * The upstream answers a revoked refresh token with `invalid_grant: Offline user
+ * session not found` (HTTP 400/401). Network failures, DNS errors and 5xx do NOT
+ * prove anything about the credential and must not mark it dead — that would
+ * take a working account out of rotation for half an hour over a hiccup.
+ */
+function isCredentialDeadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('invalid_grant')
+    || message.includes('Offline user session not found')
+    || message.includes('session_dead')
+}
+
+export class WorkBuddyAccountPool {
+  private readonly logger: AccountPoolOptions['logger']
+  private authDirs: readonly string[]
+  private cooldownMs: number
+  /**
+   * How long an account stays out of rotation after the upstream reports its
+   * credits are spent. Credit packs reset on their own schedule rather than on a
+   * rate-limit window, so this is much longer than `cooldownMs`.
+   */
+  private exhaustCooldownMs: number
+  /**
+   * How long an account stays out of rotation after the upstream rejected its
+   * sign-in. Cleared by a newer credential file or an explicit sign-in.
+   */
+  private credentialDeadCooldownMs: number
+  private readonly client: (TokenRefresher & Partial<CreditReader>) | undefined
+  private readonly refreshMarginMs: number
+  private readonly expiryReadingTtlMs: number
+  private accounts: WorkBuddyAccount[] = []
+  /**
+   * Files the last scan could not read, with the reason.
+   *
+   * Surfaced so "2 accounts" can be told apart from "4 files, 2 unreadable" —
+   * the difference between accounts being gone and files being unopenable.
+   */
+  private skippedFiles: WorkBuddySkippedFile[] = []
+  private distribution: AccountDistribution
+  /** Cursor for round-robin mode; unused under priority distribution. */
+  private cursor = 0
+  /**
+   * `sticky` mode: conversation key → account id.
+   *
+   * A conversation that keeps the same account also keeps that account's
+   * upstream prompt cache warm — the cache is per tenant, so rotating accounts
+   * mid-conversation pays full prompt cost on every turn. Insertion order is
+   * the LRU order: re-binding deletes then re-inserts.
+   */
+  private readonly affinity = new Map<string, string>()
+  /** Where the bindings above are persisted; undefined keeps them in memory. */
+  private readonly affinityPath: string | undefined
+  private affinitySaveTimer: ReturnType<typeof setTimeout> | undefined
+  private lastScanAtMs = 0
+  /**
+   * The account id the user pinned, or undefined for none.
+   *
+   * Field rather than a public property so that the only way in is
+   * {@link WorkBuddyPool.prefer} and the only way out is {@link WorkBuddyPool.preferredId}:
+   * a mutable public field would let a caller pin an account without the pool
+   * knowing, and a getter alone would let a caller read a pin the pool has
+   * already forgotten.
+   */
+  private preferredAccountId: string | undefined
+  /**
+   * Account ids the user switched off on the card.
+   *
+   * Disabling is a user preference rather than a property of the credential:
+   * `scan()` rebuilds every account object from the auth files, so the set
+   * lives on the pool and is re-applied from settings after each scan.
+   */
+  private disabledIds = new Set<string>()
+
+  /**
+   * The account ids the store held after the last successful write.
+   *
+   * Read back on the next scan to say WHICH accounts left, not just how many.
+   * The list is written wholesale, so a scan that does not find an account
+   * deletes it — and that account's credential is then unrecoverable without a
+   * fresh sign-in (#117). `undefined` until the first write, so the first scan
+   * never reports every account as "leave".
+   */
+  private lastPersistedIds: Set<string> | undefined
+  /**
+   * Account ids the user threw out of the pool for good.
+   *
+   * Enforced BEFORE the credential is parsed: `scan()` skips a file whose
+   * identity is already ignored, so an ignored account costs no at-rest key
+   * lookup (which spawns the desktop app on 5.6.0+) and cannot re-enter the pool
+   * when the app writes a fresh sign-in for it. That is the difference from
+   * {@link disabledIds}, which only filters at pick time and leaves the account
+   * listed, readable and re-discoverable.
+   *
+   * The set is supplied by the host from the plugin's own ignore file, and is
+   * replaced wholesale on every {@link applyIgnored} so removing an entry takes
+   * effect on the next scan without a restart.
+   */
+  private ignoredIds = new Set<string>()
+  /**
+   * Per-account credit floor, keyed by account id. 0 (or absent) means "spend
+   * it all".
+   *
+   * A reserved balance is protection, not a hard limit the upstream knows
+   * about: the pool simply stops picking that account once its last known
+   * balance is at or below the floor, so the user keeps a cushion instead of
+   * draining every account to zero.
+   */
+  private creditReserves = new Map<string, number>()
+  /**
+   * Last known credit balance per account, epoch ms aside.
+   *
+   * Refreshed in the background after a successful request, so a pick can
+   * consult it. An account with no reading is treated as usable: refusing to
+   * pick an account just because its balance has not been checked yet would
+   * strand a healthy pool, and the first 402 still cools it as before.
+   */
+  private creditBalances = new Map<string, number>()
+  /**
+   * Nearest expiry among each account's one-off credit packs, epoch ms.
+   *
+   * Credit packs are use-it-or-lose-it, so "which account should serve next"
+   * has a second honest answer besides "which one is idle": the one whose
+   * credits die soonest. Only one-off packs count — monthly packs refresh on
+   * their own cycle and are therefore never urgent — which is why this is
+   * written from the same `fetchCredits` reading that fills `creditBalances`.
+   *
+   * A positive value is a deadline. The two other states are kept in
+   * {@link creditExpiryNone} and {@link creditExpiryReadAt} rather than as a
+   * missing key, because a missing key cannot tell "we never looked" from "we
+   * looked and nothing has a deadline" — and only the first is worth reading
+   * again. An account whose packs are all monthly reads as `none` forever, which
+   * is exactly right: asking again cannot change the answer (S1).
+   */
+  private creditExpiry = new Map<string, number>()
+  /**
+   * Accounts whose last reading found NO one-off deadline (all monthly packs, or
+   * none at all). Written instead of deleting the key, so the account stops
+   * being a candidate for re-reading.
+   */
+  private creditExpiryNone = new Set<string>()
+  /** When each account's deadline reading was taken, epoch ms. */
+  private creditExpiryReadAt = new Map<string, number>()
+  /**
+   * Accounts whose deadline reading is being fetched right now.
+   *
+   * Same de-duplication idea as {@link refreshInflight}, for the same reason: a
+   * scan-triggered warm and a request-triggered top-up must not both spend a
+   * billing round trip on the same account. A Set rather than a Map of promises
+   * because no caller ever awaits the warm — the point is only that a second
+   * pass skips it.
+   */
+  private expiryWarmInflight = new Set<string>()
+  /**
+   * Last time the pool tried to warm an account's deadline reading, epoch ms.
+   *
+   * The TTL is the success gate, not a retry gate: a failed read writes nothing,
+   * so without this a permanently failing billing endpoint would be hit on every
+   * scan and every served request. One attempt per account per minute is cheap
+   * and still recovers quickly from a transient failure.
+   */
+  private expiryWarmAttemptAt = new Map<string, number>()
+  /**
+   * Last time each account served a request, epoch ms. Drives the idle term
+   * of the priority-mode weighting below: an account that just served loses to
+   * one that has been idle, so a small pool stops hammering a single account.
+   *
+   * In-memory on purpose: it only biases the next pick, so a cold start that
+   * treats every account as idle is the right default. Not keyed by id lookup
+   * misses because a removed account simply disappears from the map on re-scan.
+   */
+  private lastUsedAt = new Map<string, number>()
+  private refreshInflight = new Map<string, Promise<boolean>>()
+  /**
+   * Whether `scan()` seeds from and writes back the durable account store.
+   *
+   * Off by default (tests build fixtures over temp dirs and must not touch the
+   * user's real store); `createCore()` turns it on for production, which is
+   * what makes accounts gathered by switching desktop sign-ins survive a
+   * restart — the desktop app keeps only the current sign-in's credential file
+   * on disk.
+   */
+  private readonly persistent: boolean
+  /** Path of the durable store; computed once so tests can pin it. */
+  private readonly storePath: string
+  /**
+   * Optional second source of credentials: the channel pack's account pool,
+   * which holds the accounts the user signed in through the scan-login page.
+   *
+   * A function rather than a list because that pool is mounted asynchronously
+   * and can be re-read on demand; `undefined` means "no such source", which is
+   * the state every test and every pre-mount startup is in.
+   *
+   * The `| undefined` is explicit because `applyExternalSource` CLEARS the field by
+   * assigning `undefined` — under `exactOptionalPropertyTypes` a bare `?:` means
+   * "may be absent, never undefined", which made that documented clearing action
+   * a type error.
+   */
+  private externalSource?: (() => Promise<readonly WorkBuddyCredential[]>) | undefined
+
+  constructor(options: AccountPoolOptions = {}) {
+    this.logger = options.logger
+    this.authDirs = options.authDirs ?? candidateAuthDirs()
+    this.cooldownMs = options.cooldownMs ?? 60_000
+    this.exhaustCooldownMs = options.exhaustCooldownMs ?? EXHAUST_COOLDOWN_MS
+    this.credentialDeadCooldownMs = options.credentialDeadCooldownMs ?? CREDENTIAL_DEAD_COOLDOWN_MS
+    this.client = options.client
+    this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
+    this.expiryReadingTtlMs = options.expiryReadingTtlMs ?? EXPIRY_READING_TTL_MS
+    // Priority is the default: users pool their own accounts to spend one
+    // before touching the next, not to split every request evenly.
+    this.distribution = options.distribution ?? 'priority'
+    this.persistent = options.persistent ?? false
+    this.storePath = accountStorePath()
+    this.affinityPath = options.affinityPath
+    if (this.affinityPath !== undefined) this.loadAffinity()
+  }
+
+  /**
+   * Re-apply configuration that only affects discovery and cooldown policy,
+   * without rebuilding the pool. A later `scan()` uses the new auth dirs and
+   * cooldown window; existing accounts keep their in-memory state.
+   */
+  applyConfig(options: {
+    authDirs?: readonly string[]
+    cooldownMs?: number
+    exhaustCooldownMs?: number
+    distribution?: AccountDistribution
+    disabledAccountIds?: readonly string[]
+    /** Per-account credit floor, keyed by account id. Absent keeps the current map. */
+    creditReserves?: Readonly<Record<string, number>>
+  }): void {
+    if (options.authDirs !== undefined && options.authDirs.length > 0) {
+      this.authDirs = options.authDirs
+    }
+    if (options.cooldownMs !== undefined && options.cooldownMs >= 1000) {
+      this.cooldownMs = options.cooldownMs
+    }
+    if (options.exhaustCooldownMs !== undefined && options.exhaustCooldownMs >= 1000) {
+      this.exhaustCooldownMs = options.exhaustCooldownMs
+    }
+    if (options.distribution !== undefined) {
+      this.distribution = options.distribution
+    }
+    if (options.disabledAccountIds !== undefined) {
+      this.disabledIds = new Set(options.disabledAccountIds)
+    }
+    // Reserves are replaced wholesale so the map mirrors the saved document.
+    if (options.creditReserves !== undefined) this.setCreditReserves(options.creditReserves)
+  }
+
+  /**
+   * Register (or clear, with `undefined`) the extra credential source that
+   * `scan()` merges alongside the auth directories. Rescanning is the caller's
+   * job: this only changes where the next scan looks.
+   */
+  applyExternalSource(source?: () => Promise<readonly WorkBuddyCredential[]>): void {
+    this.externalSource = source
+  }
+
+  /**
+   * Replace the permanent ignore list.
+   *
+   * Also drops any already-discovered account that is now ignored, so the change
+   * is visible without waiting for the next scan: the card refreshes its status
+   * document right after the write, and an account still sitting in `accounts`
+   * would keep showing up there.
+   */
+  applyIgnored(ids: Iterable<string>): void {
+    this.ignoredIds = new Set(ids)
+    if (this.ignoredIds.size === 0) return
+    this.accounts = this.accounts.filter(account => !this.ignoredIds.has(account.id))
+  }
+
+  /** Whether this account has been thrown out of the pool for good. */
+  isIgnored(accountId: string): boolean {
+    return this.ignoredIds.has(accountId)
+  }
+
+  /** Every ignored id currently in force, in insertion order. */
+  ignoredIdsInOrder(): string[] {
+    return [...this.ignoredIds]
+  }
+
+  /**
+   * Credential files the last scan could not read, with the reason.
+   *
+   * Exposed because a short account list is otherwise indistinguishable from a
+   * broken one: with this, the card can say "2 accounts, 2 files unreadable"
+   * instead of silently showing half a pool.
+   */
+  skippedFilesInOrder(): readonly WorkBuddySkippedFile[] {
+    return this.skippedFiles
+  }
+
+  /**
+   * Delete expired snapshots that a newer credential for the same account supersedes.
+   *
+   * Returns the paths actually removed. See the call site for the full safety rule; the
+   * short version is that it touches ONLY files classified `expired`, ONLY when the same
+   * `uin` is already served by a different (loaded) file, and never a live file.
+   *
+   * `uin` rather than `uid`: it is the billing identity, so two sign-ins of one person
+   * match even when the desktop app wrote them from different installs. A file whose
+   * identity cannot be read is left alone — deleting a credential on a guess is worse than
+   * keeping a dead one on the card.
+   */
+  private async pruneExpiredSnapshots(
+    skipped: readonly WorkBuddySkippedFile[],
+    loaded: readonly WorkBuddyCredential[],
+  ): Promise<readonly string[]> {
+    const expired = skipped.filter(entry => entry.reason === 'expired')
+    if (expired.length === 0) return []
+    // Files the running app owns: never deleted, whatever their state.
+    const liveNames = new Set([WORKBUDDY_LIVE_FILENAME, 'workbuddy-desktop-ai.info'])
+    /**
+     * The identities already served by a file that loaded in this same scan.
+     *
+     * Taken from the parsed credentials rather than by re-reading each file: `found`
+     * already carries `uin`, and a second read of a file that just parsed would only add a
+     * chance to fail.
+     */
+    const servedUins = new Set<string>()
+    for (const credential of loaded) {
+      if (credential.uin !== undefined && credential.uin !== '') servedUins.add(credential.uin)
+    }
+    if (servedUins.size === 0) return []
+
+    const removed: string[] = []
+    for (const entry of expired) {
+      if (liveNames.has(basename(entry.path))) continue
+      // `parseWorkBuddyAuth` refuses an expired document by design, so the identity is
+      // read from the raw JSON instead of through it.
+      const uin = await cheapUinFromFile(entry.path)
+      if (uin === undefined || !servedUins.has(uin)) continue
+      try {
+        await unlink(entry.path)
+        removed.push(entry.path)
+      } catch (error: unknown) {
+        this.logger?.warn?.(`dsh-xdpool: could not remove expired snapshot ${entry.path}: ${String(error)}`)
+      }
+    }
+    return removed
+  }
+
+  /** Rescan the auth directories and merge newly discovered accounts. */
+  async scan(): Promise<WorkBuddyAccount[]> {
+    const found: WorkBuddyCredential[] = []
+    const skipped: WorkBuddySkippedFile[] = []
+    // The plugin's own data directory is a scan source too: `import` writes
+    // `<md5prefix>.json` snapshots there, and every credential in it is an
+    // account the user deliberately parked. Without this the snapshots were
+    // written and never read back.
+    const scanDirs: readonly string[] = this.persistent
+      ? [...this.authDirs, snapshotDirPath()]
+      : this.authDirs
+    for (const dir of scanDirs) {
+      const files = dir === snapshotDirPath()
+        ? await snapshotFilesIn(dir)
+        : await authFilesIn(dir)
+      for (const file of files) {
+        // Honour the ignore list BEFORE reading the document's key material.
+        // `cheapIdentityId` reads only the plain `uin`/`uid` fields, so an
+        // ignored account is skipped without spawning the desktop app for its
+        // at-rest key. A document whose identity lives in an encrypted nickname
+        // returns undefined here and is checked again after the full parse
+        // below — slower, but never wrongly admitted.
+        if (this.ignoredIds.size > 0) {
+          const cheapId = await cheapIdentityIdFromFile(file)
+          if (cheapId !== undefined && this.ignoredIds.has(cheapId)) continue
+        }
+        const credential = await readCredential(file)
+        if (credential === undefined) {
+          // Record WHY, so a pool of "2" next to a disk holding 4 files can say
+          // which two were unreadable and what prevented them. Silently dropping
+          // them is what made the number look like accounts had vanished.
+          skipped.push({ path: file, reason: await skipReasonFor(file) })
+          continue
+        }
+        // Second gate: the cheap probe could not identify this file, so the
+        // ignored check happens now that the credential is fully parsed.
+        if (this.ignoredIds.size > 0 && this.ignoredIds.has(workbuddyAccountId(credential))) continue
+        found.push(credential)
+      }
+    }
+    this.skippedFiles = skipped
+    if (skipped.length > 0) {
+      this.logger?.warn?.(
+        `dsh-xdpool: ${skipped.length} credential file(s) could not be read; `
+        + `${found.length} account(s) still loaded. Reasons: `
+        + [...new Set(skipped.map(s => s.reason))].join('; '),
+      )
+    }
+    /**
+     * Remove expired snapshots whose account is served by a newer credential.
+     *
+     * A rotated sign-in leaves the old snapshot on disk forever: the desktop app writes a
+     * new `workbuddy-desktop.<ts>.<pid>.<uuid>.info` each time and never deletes the
+     * previous one. Within a month every one of them passes its `refreshExpiresAt` and the
+     * card starts listing a growing pile of "expired" files the user cannot act on —
+     * they are dead weight from a sign-in that already succeeded.
+     *
+     * The safety rule is narrow on purpose, because deleting a credential file is
+     * destructive and the auth directory belongs to another application:
+     *
+     *   - ONLY files this scan classified as `expired` — never `encrypted`, `unreadable`
+     *     or `malformed`, which may be the very file holding a working key;
+     *   - ONLY when the SAME account (by `uin`, the billing identity) was loaded from a
+     *     DIFFERENT file, i.e. a newer credential exists to serve it;
+     *   - never the live `workbuddy-desktop.info` / `workbuddy-desktop-ai.info`, which the
+     *     running app owns and rewrites.
+     *
+     * Anything skipped for not meeting all three is left alone and keeps its entry on the
+     * card, so the user still learns it is there.
+     */
+    const cleaned = await this.pruneExpiredSnapshots(skipped, found)
+    if (cleaned.length > 0) {
+      this.skippedFiles = skipped.filter(entry => !cleaned.includes(entry.path))
+      this.logger?.info?.(
+        `dsh-xdpool: removed ${cleaned.length} expired credential snapshot(s) superseded by a newer sign-in`,
+      )
+    }
+
+    // Accounts that signed in through the scan-login page never touch an auth
+    // directory — the channel pack keeps their credentials under its own
+    // namespace — so they are collected here and merged by the same identity
+    // rule as desktop sign-ins. That merge is the whole point: one person who
+    // signed in both ways must show up as one account, on the same card.
+    if (this.externalSource !== undefined) {
+      try {
+        const external = await this.externalSource()
+        for (const credential of external) {
+          if (this.ignoredIds.size > 0 && this.ignoredIds.has(workbuddyAccountId(credential))) continue
+          found.push(credential)
+        }
+      } catch (error: unknown) {
+        // A source that cannot answer is a missing pool, not a broken one: the
+        // desktop accounts found above are still valid and still usable.
+        this.logger?.warn?.('dsh-xdpool: could not read channel-pack accounts; desktop accounts only', error)
+      }
+    }
+
+    const byId = new Map<string, WorkBuddyAccount>()
+    // Seed with existing accounts so cooldown state survives a rescan.
+    for (const account of this.accounts) byId.set(account.id, account)
+
+    // Seed from the durable store so accounts gathered in a previous process
+    // (by switching desktop sign-ins) come back after a restart. Seeded
+    // accounts are inserted FIRST so a credential freshly read from disk wins
+    // the freshness comparison below — the store is memory, the auth dir is
+    // the truth.
+    //
+    // NOT gated on `this.accounts.length === 0` any more. That condition made
+    // this the ONE case the store could not serve: the desktop app keeps only
+    // the most-recently-signed-in account's `.info`, so "some accounts have an
+    // .info and some do not" is the NORMAL state — and in it the store was
+    // skipped, `this.accounts` (holding only what this scan found) was written
+    // back over it, and every account without an `.info` was deleted from disk
+    // with no warning (#117). Reported damage: a 6-account pool lost its
+    // highest-balance account (2,299 credits) and the user only noticed a card
+    // was missing.
+    //
+    // The loop is already safe without the gate: `byId` holds this scan's
+    // accounts first, and the `has` check below means a stored entry can only
+    // ADD an account, never overwrite a fresher in-memory credential.
+    if (this.persistent) {
+      const stored = await loadStoredAccounts(this.storePath)
+      for (const entry of stored) {
+        if (this.ignoredIds.size > 0 && this.ignoredIds.has(entry.id)) continue
+        if (byId.has(entry.id)) continue
+        byId.set(entry.id, {
+          id: entry.id,
+          label: entry.label,
+          credential: entry.credential,
+          cooldownUntilMs: 0,
+          modelCooldowns: {},
+          rateLimitHits: 0,
+        })
+      }
+    }
+
+    // Second index: the account UUID alone.
+    //
+    // The two sign-in routes do not agree on which identity they can prove. A
+    // desktop sign-in writes both `uin` (the numeric billing id) and `uid` (the
+    // account UUID); a scan sign-in through the channel pack only ever learns
+    // the UUID, because the pack records it as `user_id` from the login
+    // response. `workbuddyAccountId` prefers `uin`, so the same person arriving
+    // by the two routes hashed to two different ids and the pool showed one
+    // human twice — with one copy carrying the scan credentials and the other
+    // the desktop ones, each contributing its own share of the model list.
+    //
+    // Rekeying on `uid` was the tempting fix and the wrong one: every cooldown,
+    // dead mark, ignore-list entry and stored snapshot is filed under the
+    // existing id, so changing the hash would retire all of it at once. Merging
+    // onto whichever id is already present keeps that state and makes the later
+    // sighting of the same human collapse into the earlier one instead.
+    const byUid = new Map<string, string>()
+    for (const account of byId.values()) {
+      const uid = account.credential.uid
+      if (typeof uid === 'string' && uid !== '' && !byUid.has(uid)) byUid.set(uid, account.id)
+    }
+
+    for (const credential of found) {
+      const byIdentity = workbuddyAccountId(credential)
+      // Join the row that already holds this UUID, whichever id it is filed
+      // under. Deliberately not conditioned on `uin` being absent: a full
+      // desktop credential arriving second must land on the row the scanned one
+      // already created, or the two orders would produce two different pool
+      // layouts for the same human — and rekeying on every rescan would strand
+      // the cooldowns filed under the first id.
+      const uid = credential.uid
+      const knownId = typeof uid === 'string' && uid !== '' ? byUid.get(uid) : undefined
+      const id = knownId ?? byIdentity
+      if (knownId === undefined && typeof uid === 'string' && uid !== '') byUid.set(uid, id)
+      const existing = byId.get(id)
+      if (existing === undefined) {
+        byId.set(id, {
+          id,
+          label: accountLabel(credential),
+          credential,
+          cooldownUntilMs: 0,
+          modelCooldowns: {},
+          rateLimitHits: 0,
+        })
+        continue
+      }
+      // Keep whichever credential the app/upstream considers current. The stored
+      // expiry alone is not a freshness signal, so this goes through `isFresher`
+      // rather than comparing expiry values directly.
+      if (isFresher(credential, existing.credential)) {
+        // A different refresh token means the user signed in again, which is the
+        // one thing that revives an account the upstream had rejected. Without
+        // this the dead mark would outlive the very fix it is waiting for.
+        const signedInAgain = credential.refreshToken !== existing.credential.refreshToken
+          || credential.accessToken !== existing.credential.accessToken
+        byId.set(id, {
+          ...existing,
+          credential,
+          label: accountLabel(credential),
+          ...signedInAgain ? { credentialDeadUntilMs: 0 } : {},
+        })
+      }
+    }
+
+    // A stable, predictable order is what makes "prefer the first account"
+    // meaningful: a live sign-in leads, then the most recently issued
+    // credential, then the newest expiry. `byId` already preserves the order
+    // accounts were first discovered, so re-scans do not shuffle the queue.
+    const ordered = [...byId.values()]
+    ordered.sort((a, b) => compareFreshness(a.credential, b.credential))
+    this.accounts = ordered
+    this.lastScanAtMs = Date.now()
+    // Fill the deadline readings the pick depends on. Deliberately NOT awaited:
+    // `scan()` runs on the first request of a process (see `acquire`), so
+    // awaiting a billing read per account here would put up to 30 s of network
+    // IO inside that request — the very cost S3 rejected. The first pick after a
+    // cold start therefore still degrades to pool order, but it now says so out
+    // loud (see `pickByExpiry`) and the readings land moments later.
+    this.warmExpiryReadings()
+    // Persist the merged list so the next process starts from it. Written on
+    // every scan: scans are event-driven (login, card refresh), not per-request,
+    // so the write cost is negligible next to the at-rest key spawns a scan
+    // already pays.
+    if (this.persistent) {
+      try {
+        // Say it when a scan SHRINKS the store. The list is written wholesale, so
+        // anything this scan did not find and the store did not hold is gone for
+        // good — and the store holds the only copy of those credentials. A user
+        // whose card list quietly lost an account had no way to know it happened
+        // (#117), so the disappearance is reported with the ids that left. This
+        // is a log line rather than a block: a legitimate removal (the user
+        // deleted the account) goes through the same path, and refusing to write
+        // would resurrect it on every scan.
+        const leaving = this.lastPersistedIds === undefined
+          ? []
+          : [...this.lastPersistedIds].filter(id => !this.accounts.some(account => account.id === id))
+        if (leaving.length > 0) {
+          this.logger?.warn?.(
+            `dsh-xdpool: ${String(leaving.length)} account(s) are no longer in the pool after a rescan `
+              + `and were removed from the store: ${leaving.join(', ')}. `
+              + 'Their credentials are gone unless they are signed in again.',
+          )
+        }
+        await saveStoredAccounts(this.storePath, this.accounts)
+        this.lastPersistedIds = new Set(this.accounts.map(account => account.id))
+      } catch (error: unknown) {
+        this.logger?.warn?.('dsh-xdpool: could not persist the account store', error)
+      }
+    }
+    return this.accounts
+  }
+
+  /**
+   * Warm the deadline readings that `expiry` mode sorts on.
+   *
+   * Fire-and-forget on purpose, from `scan()`: the pool's first request arrives
+   * before any reading exists, and the honest answer to that is the documented
+   * fallback plus a log line, not a stalled request. Everything about the call
+   * is chosen to be unable to make things worse:
+   *
+   *   - `this.client` may not exist (a host that wired only token refresh), in
+   *     which case there is nothing to read with and the pass is a no-op — the
+   *     same guard `ensureFresh` uses;
+   *   - a dead sign-in is skipped, and a successful read NEVER calls
+   *     `clearCredentialDead`. That is the difference between this and
+   *     `reviveBenched`: the billing endpoint answers 200 for a banned account
+   *     (observed on 11140), so treating a read as proof of health is what got a
+   *     banned account revived six times in a day (S2). Only a token refresh or a
+   *     fresh sign-in may clear that mark;
+   *   - accounts whose reading is fresh enough are skipped, and so are accounts
+   *     already being read (S10's de-duplication, mirroring `refreshInflight`);
+   *   - a failed read writes nothing and only warns, so the next pass tries
+   *     again without the failure being mistaken for a reading.
+   */
+  private warmExpiryReadings(): void {
+    if (this.client?.fetchCredits === undefined) return
+    for (const account of this.accounts) this.warmExpiryReadingFor(account.id)
+  }
+
+  /** One account's warm read; see {@link warmExpiryReadings} for the rules. */
+  private async warmOneExpiryReading(
+    account: WorkBuddyAccount,
+    client: TokenRefresher & CreditReader,
+  ): Promise<void> {
+    this.expiryWarmInflight.add(account.id)
+    this.expiryWarmAttemptAt.set(account.id, Date.now())
+    try {
+      const credits = await client.fetchCredits(account.credential)
+      // Deadline only: the balance is the reserve's business and this read was
+      // not asked for by the user (S7).
+      this.noteExpiryOnly(account.id, credits.nearestExpiryMs)
+    } catch (error: unknown) {
+      // Keep whatever reading we had; a failed read is not evidence of anything.
+      // The account is named so a systematically broken billing endpoint can be
+      // told apart from a pool that simply has not been read yet.
+      this.logger?.warn?.(
+        `dsh-xdpool: could not read credit deadlines for ${account.label} `
+          + '(read failed); expiry mode keeps falling back for it until a read succeeds',
+        error,
+      )
+    } finally {
+      this.expiryWarmInflight.delete(account.id)
+    }
+  }
+
+  /**
+   * Top up one account's deadline reading, from wherever the pool notices it is
+   * missing or stale.
+   *
+   * The request path is the second caller (after `scan()`), because a reading
+   * ages out while the pool is busy too: the shim calls this for the account that
+   * just served a request, which is the one whose spend is most likely to have
+   * moved its deadline. No timer is created — the existing balance refresh is
+   * already the natural heartbeat, and this rides on it.
+   *
+   * Every gate lives here rather than in the callers, so both paths obey exactly
+   * the same rules: no client, no account, a rejected sign-in, an already-running
+   * read, a finished "nothing expires" answer, a fresh reading, or an attempt
+   * made within the last minute all mean "do nothing".
+   */
+  warmExpiryReadingFor(accountId: string): void {
+    // Nothing sorts on the deadline in the other modes, so reading it would be
+    // background traffic with no consumer. The pool follows the user's choice.
+    if (this.distribution !== 'expiry') return
+    const client = this.client
+    if (client?.fetchCredits === undefined) return
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    const now = Date.now()
+    if ((account.credentialDeadUntilMs ?? 0) > now) return
+    if (this.expiryWarmInflight.has(accountId)) return
+    const reading = this.expiryReadingOf(accountId, now)
+    // `none` is a finished answer and never expires; `at` is good until the TTL
+    // runs out. Both mean there is nothing to learn here.
+    if (reading.state === 'none') return
+    if (reading.state === 'at' && !reading.stale) return
+    // Throttle FAILED attempts only. An attempt that happened after the last
+    // successful read is one that learned nothing, and repeating it on every
+    // request would hammer a broken billing endpoint; an attempt older than the
+    // reading it follows is just the TTL doing its job and must go through.
+    const lastAttempt = this.expiryWarmAttemptAt.get(accountId) ?? 0
+    if (lastAttempt > (reading.readAtMs ?? 0) && now - lastAttempt < EXPIRY_WARM_RETRY_MS) return
+    void this.warmOneExpiryReading(account, client as TokenRefresher & CreditReader)
+  }
+
+  /** All accounts, cooldown state included. */
+  list(region?: WorkBuddyRegion): readonly WorkBuddyAccount[] {
+    if (region === undefined) return this.accounts
+    return this.accounts.filter(account => regionOf(account.credential.domain) === region)
+  }
+
+  /**
+   * Accounts currently eligible to serve a request.
+   *
+   * With a `modelId`, an account is eligible when it is not account-wide cooled
+   * AND that model is not cooling on it — so a 429 on `hy4-preview` only keeps
+   * that model out while `hy3` on the same account stays usable. Without a
+   * model id the legacy account-wide check applies (callers that cannot name a
+   * model, e.g. CLI diagnostics).
+   */
+  private available(now: number, modelId?: string, region?: WorkBuddyRegion, reserveExempt?: ReadonlySet<string>): WorkBuddyAccount[] {
+    return this.accounts.filter(account => {
+      // Switched off on the card: never serves a request, but still listed so
+      // the card can switch it back on.
+      if (this.disabledIds.has(account.id)) return false
+      // Reserved credits: stop picking an account once its last known balance
+      // reached the floor the user set for it. An account with no reading stays
+      // in play (see creditBalances), so an unprobed pool is not stranded.
+      //
+      // KNOWN GAP, deliberately not fixed here: on a cold start `creditBalances`
+      // is empty for the same reason `creditExpiry` was, so this floor silently
+      // does not apply until the first reading lands — the same structural bug
+      // as the expiry one, reported as V4 in
+      // `xdpool-fix/EXPIRY-ADVERSARIAL-20261111.md` §3 and tracked separately.
+      const reserve = this.creditReserves.get(account.id)
+      if (!reserveExempt?.has(account.id) && reserve !== undefined && reserve > 0) {
+        const balance = this.creditBalances.get(account.id)
+        if (balance !== undefined && balance <= reserve) return false
+      }
+      if (account.cooldownUntilMs > now) return false
+      // Sign-in rejected by the upstream: the credential file still LOOKS fresh
+      // (the upstream never rewrites its expiry), so this is the only thing
+      // keeping a dead account from absorbing every retry of a request.
+      if ((account.credentialDeadUntilMs ?? 0) > now) return false
+      if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
+      // A region-scoped caller (one of the two providers) must never pick
+      // an account that talks to the other region gateway.
+      if (region !== undefined && regionOf(account.credential.domain) !== region) return false
+      return true
+    })
+  }
+
+  /**
+   * The pool ordered into three bands, so a resting account is deferred instead of
+   * discarded.
+   *
+   * `available()` answers a binary question, and a binary answer loses the
+   * distinction that matters most when a pool is under pressure:
+   *
+   *   - an account that still HAS credits but was rate-limited a moment ago is
+   *     healthy — it should be tried AFTER the others, not treated as gone;
+   *   - an account resting after a failure is the last resort, but it is still a
+   *     resort: when it is the only one, trying it beats failing the request.
+   *
+   * A pool that drops both from the list turns "every account is cooling for
+   * twenty more seconds" into an error the user reads as "no account available",
+   * which is a different and much more alarming statement.
+   *
+   * The bands:
+   *
+   *   1. `ready`    — passes every gate `available()` checks.
+   *   2. `limited`  — region-eligible and not disabled/reserved, but cooling for
+   *                   this model or account-wide. Ordered by when it comes back,
+   *                   so the account that recovers first is spent first.
+   *   3. `resting`  — sign-in was rejected by the upstream. It never heals on a
+   *                   timer, so it is only tried when 1 and 2 are both empty.
+   *
+   * `disabled` and `reserve` accounts appear in NO band: those are user choices,
+   * and overriding them is not resilience, it is ignoring an instruction.
+   *
+   * Kept separate from `available()` rather than replacing it, so the binary
+   * question still has a binary answer for callers that want one (diagnostics,
+   * the status document) without either copy drifting from the other.
+   */
+  private rankedPool(
+    now: number,
+    modelId?: string,
+    region?: WorkBuddyRegion,
+    reserveExempt?: ReadonlySet<string>,
+  ): { ready: WorkBuddyAccount[]; limited: WorkBuddyAccount[]; resting: WorkBuddyAccount[] } {
+    const ready: WorkBuddyAccount[] = []
+    const limited: { account: WorkBuddyAccount; backAt: number }[] = []
+    const resting: WorkBuddyAccount[] = []
+    for (const account of this.accounts) {
+      // Refusals that outrank any resilience: the user switched it off, or its
+      // balance reached the floor the user reserved. Those must not be spent, so
+      // they are absent from every band.
+      if (this.disabledIds.has(account.id)) continue
+      const reserve = this.creditReserves.get(account.id)
+      if (!reserveExempt?.has(account.id) && reserve !== undefined && reserve > 0) {
+        const balance = this.creditBalances.get(account.id)
+        if (balance !== undefined && balance <= reserve) continue
+      }
+      if (region !== undefined && regionOf(account.credential.domain) !== region) continue
+
+      const deadUntil = account.credentialDeadUntilMs ?? 0
+      const coolUntil = account.cooldownUntilMs
+      const modelUntil = modelId === undefined ? 0 : (account.modelCooldowns[modelId] ?? 0)
+      // A rejected sign-in never heals on its own, so it sits in the lowest band
+      // even after its cooldown has expired.
+      if (deadUntil > now) {
+        resting.push(account)
+        continue
+      }
+      /**
+       * Only a MODEL-level cooldown earns a retry; an account-wide one does not.
+       *
+       * The distinction is what keeps the tier honest. A 429 on one model leaves
+       * the account working for every other model, so trying it again for a
+       * different model is reasonable and often succeeds. An account-wide cooldown
+       * (credits exhausted, quota wall) means the gateway has already said no to
+       * this account as a whole — retrying it spends a round trip to be told the
+       * same thing, and the caller then reports 502 where the truthful answer was
+       * 429. That degradation is worse than the resilience is worth, so the
+       * account-wide case stays out of play entirely.
+       */
+      if (coolUntil > now) continue
+      if (modelUntil > now) {
+        limited.push({ account, backAt: modelUntil })
+        continue
+      }
+      ready.push(account)
+    }
+    // Soonest-back first: the point of the band is to spend a recovering account
+    // before one that is out for another hour.
+    limited.sort((a, b) => a.backAt - b.backAt)
+    return { ready, limited: limited.map(entry => entry.account), resting }
+  }
+
+  /**
+   * Why no account is available right now, for an accurate error.
+   *
+   * The pool can be empty for reasons that need OPPOSITE remedies: nobody is
+   * signed in (the user must sign in), every account is rate-limited (the user
+   * must wait, and retrying later works), or every account was switched off /
+   * ignored (the user must re-enable one). Reporting all of them as "no
+   * credential, sign in" sent users to re-authenticate over a temporary 429 —
+   * observed as an "API key invalid" panel for a model that was merely cooling.
+   *
+   * Counts are over the region's accounts, since a provider only ever sees its
+   * own gateway.
+   */
+  unavailableReason(modelId?: string, region?: WorkBuddyRegion, reserveExempt?: ReadonlySet<string>): {
+    total: number
+    cooling: number
+    disabled: number
+    /** Accounts skipped because the upstream rejected their sign-in. */
+    dead: number
+    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'none'
+  } {
+    const now = Date.now()
+    const inRegion = this.accounts.filter(
+      account => region === undefined || regionOf(account.credential.domain) === region,
+    )
+    if (inRegion.length === 0) return { total: 0, cooling: 0, disabled: 0, dead: 0, reason: 'empty' }
+
+    let cooling = 0
+    let disabled = 0
+    let dead = 0
+    /**
+     * Accounts that survived every OTHER filter and are held back only by their
+     * credit floor.
+     *
+     * Counted rather than returned on the first hit. The old `return` fired the
+     * moment it met one reserved account, so a single account parked under its
+     * floor reported `reserve` for the whole gateway — even while four other
+     * accounts were healthy and had just been tried. The caller turns
+     * `reason === 'reserve'` into a 402 telling the user to lower the reserve,
+     * which pointed at a setting that was not the problem (#98: a five-account
+     * pool reported `reserve_floor` because of one account that had sat below
+     * its floor for weeks, while the actual state was "the rest are cooling").
+     */
+    let reserved = 0
+    /**
+     * Accounts that reached the end of the walk unblocked.
+     *
+     * Non-zero means the pool still has somewhere to send a request, so a
+     * reserve is NOT what this answer is about: editing a number cannot fix a
+     * request that some other account is already able to serve, and saying
+     * otherwise sends the reader to the wrong setting.
+     */
+    let usable = 0
+    for (const account of inRegion) {
+      if (this.disabledIds.has(account.id)) { disabled += 1; continue }
+      // Sign-in rejected: counted separately from "cooling", because the remedy
+      // is the opposite one (sign in again, not wait).
+      if ((account.credentialDeadUntilMs ?? 0) > now) { dead += 1; continue }
+      const modelCooling = modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now
+      if (account.cooldownUntilMs > now || modelCooling) { cooling += 1; continue }
+      const reserve = this.creditReserves.get(account.id)
+      if (!reserveExempt?.has(account.id) && reserve !== undefined && reserve > 0) {
+        const balance = this.creditBalances.get(account.id)
+        if (balance !== undefined && balance <= reserve) { reserved += 1; continue }
+      }
+      usable += 1
+    }
+    // A rejected sign-in outranks a cooldown: waiting does not fix it.
+    if (dead > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'session_dead' }
+    if (cooling > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'cooling' }
+    if (disabled > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'disabled' }
+    // Only with no other explanation AND nothing left usable does the reserve
+    // actually explain the failure: it then means EVERY remaining account is
+    // parked at or below its floor.
+    if (usable === 0 && reserved > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, reason: 'reserve' }
+    }
+    return { total: inRegion.length, cooling, disabled, dead, reason: 'none' }
+  }
+
+  /** Round-robin: the legacy cursor walk, kept for the distribution that asks for it. */
+  private pickRoundRobin(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    const index = this.cursor % pool.length
+    const account = pool[index]
+    if (account === undefined) return undefined
+    this.cursor = (index + 1) % pool.length
+    return account
+  }
+
+  /** Remember which account a conversation is bound to, keeping LRU order. */
+  private bindAffinity(conversationKey: string, accountId: string): void {
+    this.affinity.delete(conversationKey)
+    this.affinity.set(conversationKey, accountId)
+    while (this.affinity.size > STICKY_AFFINITY_LIMIT) {
+      const oldest = this.affinity.keys().next().value
+      if (oldest === undefined) break
+      this.affinity.delete(oldest)
+    }
+    this.scheduleAffinitySave()
+  }
+
+  /**
+   * Restore bindings written by a previous process.
+   *
+   * Tolerant like the other state files: a malformed document or one bad entry
+   * must not take the pool down, and an account id that no longer exists is
+   * simply never matched (the next acquire re-picks and rebinds).
+   */
+  private loadAffinity(): void {
+    if (this.affinityPath === undefined) return
+    try {
+      const raw = JSON.parse(readFileSync(this.affinityPath, 'utf8')) as { bindings?: unknown }
+      const bindings = raw.bindings
+      if (typeof bindings !== 'object' || bindings === null || Array.isArray(bindings)) return
+      for (const [key, value] of Object.entries(bindings as Record<string, unknown>)) {
+        if (key === '' || typeof value !== 'string' || value === '') continue
+        this.affinity.set(key, value)
+      }
+      while (this.affinity.size > STICKY_AFFINITY_LIMIT) {
+        const oldest = this.affinity.keys().next().value
+        if (oldest === undefined) break
+        this.affinity.delete(oldest)
+      }
+    } catch { /* first run, or an unreadable file: start empty */ }
+  }
+
+  /** Write the bindings back, coalescing a burst into one atomic rename. */
+  private scheduleAffinitySave(): void {
+    if (this.affinityPath === undefined || this.affinitySaveTimer !== undefined) return
+    this.affinitySaveTimer = setTimeout(() => {
+      this.affinitySaveTimer = undefined
+      const path = this.affinityPath
+      if (path === undefined) return
+      try {
+        mkdirSync(dirname(path), { recursive: true })
+        writeFileSync(
+          `${path}.tmp`,
+          `${JSON.stringify({ version: 1, bindings: Object.fromEntries(this.affinity) }, null, 2)}
+`,
+          'utf8',
+        )
+        renameSync(`${path}.tmp`, path)
+      } catch { /* a lost binding costs one re-pick, never a request */ }
+    }, 500)
+    this.affinitySaveTimer.unref?.()
+  }
+
+  /**
+   * `sticky`: the account this conversation already used, when it can still
+   * serve the model being asked for.
+   *
+   * Returns `undefined` both when there is no binding and when the binding is
+   * no longer eligible (cooling for this model, disabled, out of credits) — the
+   * caller then rebinds, which is what makes a rate-limited conversation hop to
+   * a fresh account instead of failing.
+   */
+  private affinityAccount(pool: readonly WorkBuddyAccount[], conversationKey: string | undefined): WorkBuddyAccount | undefined {
+    if (conversationKey === undefined || conversationKey === '') return undefined
+    const boundId = this.affinity.get(conversationKey)
+    if (boundId === undefined) return undefined
+    const bound = pool.find(account => account.id === boundId)
+    if (bound === undefined) {
+      // The binding is stale: the account is gone, disabled, or cooling for
+      // this model. Drop it so the next turn does not re-check it.
+      this.affinity.delete(conversationKey)
+      return undefined
+    }
+    // Re-insert to mark this binding as most recently used.
+    this.bindAffinity(conversationKey, boundId)
+    return bound
+  }
+
+  /** Bindings currently remembered; exposed for tests and diagnostics. */
+  affinitySize(): number {
+    return this.affinity.size
+  }
+
+  /** Forget every conversation binding (tests, and a settings change). */
+  clearAffinity(): void {
+    this.affinity.clear()
+  }
+
+  /**
+   * Priority mode: weighted random over the eligible accounts.
+   *
+   * The weight is an idle bonus — `1 + min(idleHours * perHour, max)` — so an
+   * account that has never served (or has been idle for a while) outranks one
+   * that just answered. Reference panel logic drops its success-rate term
+   * entirely because a lifetime error counter penalises an account forever;
+   * instantaneous health is already handled by cooldowns, which is why those
+   * accounts never reach this list.
+   *
+   * A pool with no idle history (fresh process) hashes to equal weights, which
+   * spreads the very first picks instead of always returning index 0.
+   */
+  private pickByWeight(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    if (pool.length === 1) return pool[0]
+    const now = Date.now()
+    const weights = pool.map((account) => idleWeight(this.lastUsedAt.get(account.id), now))
+    const total = weights.reduce((sum, weight) => sum + weight, 0)
+    if (!Number.isFinite(total) || total <= 0) return pool[0]
+    let roll = Math.random() * total
+    for (let index = 0; index < pool.length; index += 1) {
+      roll -= weights[index] ?? 0
+      if (roll < 0) return pool[index]
+    }
+    return pool[pool.length - 1]
+  }
+
+  /**
+   * `expiry` mode: the account whose one-off credit packs die soonest.
+   *
+   * Credit packs are use-it-or-lose-it, so spending the dying ones first is
+   * strictly better than spreading the spend: an account that expires with
+   * credits left is money burnt, while an account whose packs have no deadline
+   * loses nothing by waiting. Two accounts expiring at the same instant fall
+   * back to the pool order, and an account with no known expiry sorts last —
+   * "we have not looked" must never outrank a real deadline.
+   *
+   * A pool where nobody has a known expiry therefore behaves exactly like
+   * priority, which is the honest degradation: without a reading there is
+   * nothing to sort by.
+   *
+   * What this method must NOT do is pretend. With only SOME readings in hand it
+   * still has to fall back to `pool[0]`, because picking the earliest of the
+   * accounts that happen to have answered would silently drop the account that
+   * really dies first — the failure mode S0 in `EXPIRY-ADVERSARIAL-20261111.md`
+   * called "worse than not fixing it", since the pick looks plausible and is
+   * wrong. So the incomplete case is announced instead: the caller keeps the old
+   * semantics and the log says which accounts were not read.
+   */
+  private pickByExpiry(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    const now = Date.now()
+    const unread: WorkBuddyAccount[] = []
+    const stale: WorkBuddyAccount[] = []
+    let best: WorkBuddyAccount | undefined
+    let bestAt = Number.POSITIVE_INFINITY
+    for (const account of pool) {
+      const reading = this.expiryReadingOf(account.id, now)
+      // An expired reading is treated exactly like a missing one: it describes a
+      // pack list that may already have been spent, so sorting on it would send
+      // the next request to an account whose deadline moved. It is reported
+      // separately because the two need different remedies (wait for the request
+      // path vs. read at all).
+      // "Too old to trust" is treated as "unread" everywhere it matters: the
+      // account is not sorted on, and it is named in the warning below. It is
+      // ALSO collected separately so the log can say which of the two happened
+      // — one is fixed by waiting for the request path, the other by reading.
+      if (reading.stale) stale.push(account)
+      if (reading.state === 'unread' || reading.stale) {
+        unread.push(account)
+        continue
+      }
+      if (reading.state === 'none') continue
+      const at = reading.at ?? Number.POSITIVE_INFINITY
+      if (at < bestAt) { best = account; bestAt = at }
+    }
+    if (stale.length > 0) {
+      this.logger?.info?.(
+        `dsh-xdpool: expiry mode found ${stale.length} deadline reading(s) older than `
+          + `${Math.round(this.expiryReadingTtlMs / 60_000)} minute(s) `
+          + `(${stale.map(account => account.label).join(', ')}); they are being topped up in the background`,
+      )
+    }
+    if (unread.length > 0) {
+      this.logger?.warn?.(
+        `dsh-xdpool: expiry mode has no deadline reading for ${unread.length} of ${pool.length} `
+          + `account(s) (${unread.map(account => account.label).join(', ')}); `
+          + 'falling back to pool order for this pick, which may not be the soonest to expire. '
+          + 'Readings are filled in the background after a scan and by the request path.',
+      )
+    }
+    return best ?? pool[0]
+  }
+
+  /**
+   * Pick the account to serve a request.
+   *
+   * Two distributions, chosen by the `distribution` setting:
+   *
+   * - **priority** (default, and what the card ships with): one account serves
+   *   every request until it is rate-limited, then the next in order takes over.
+   *   Credits drain one account at a time, and a cooling account returns to the
+   *   head of the queue the moment its window resets — it was never consumed, so
+   *   it resumes straight away.
+   * - **round-robin**: consecutive requests rotate through the pool so spend
+   *   spreads evenly across every account.
+   * - **sticky**: one account per conversation, and a new conversation moves to
+   *   the next account in order. Keeps the upstream prompt cache warm within a
+   *   conversation while still spreading spend across conversations.
+   * - **expiry**: the account whose one-off credit packs expire soonest serves
+   *   first, so use-it-or-lose-it credits are spent before they vanish.
+   *
+   * In every mode an explicit user selection (`prefer`) heads the list, a
+   * cooling account is skipped for that model only, and an unrecognised setting
+   * falls back to priority.
+   *
+   * Scans on first use, and rescans when every known account is cooling down: a
+   * fresh desktop login is the usual way out of an exhausted pool.
+   *
+   * `reserveExempt` is host-only: account ids whose own credentials freshly
+   * confirmed a zero-credit model. It never bypasses disabled, dead credentials, cooldowns or region.
+   * `conversationKey` is only consulted under `sticky`; other modes ignore it.
+   */
+  async acquire(modelId?: string, region?: WorkBuddyRegion, conversationKey?: string, reserveExempt?: ReadonlySet<string>): Promise<WorkBuddyAccount | undefined> {
+    if (this.accounts.length === 0) await this.scan()
+    // One attempt per account: a token refresh can PROVE a credential revoked
+    // (see ensureFresh), which marks that account dead and removes it from the
+    // next `available()` call. Looping here means a request still lands on a
+    // healthy account in that turn instead of failing over a dead one.
+    const maxTries = this.accounts.length + 1
+    for (let attempt = 0; attempt < maxTries; attempt += 1) {
+      let bands = this.rankedPool(Date.now(), modelId, region, reserveExempt)
+      if (bands.ready.length === 0 && bands.limited.length === 0 && bands.resting.length === 0 && attempt === 0) {
+        await this.scan()
+        bands = this.rankedPool(Date.now(), modelId, region, reserveExempt)
+      }
+      /**
+       * Fall through the bands, in order — but the fall-through is a STAGE, not a
+       * concatenation, and only `ready` is offered to the strategy when it is
+       * non-empty.
+       *
+       * This distinction is the whole correctness of the change. A strategy like
+       * `balanced` draws from the pool by weight and does not read the order at
+       * all, so handing it `[...ready, ...limited]` would let it pick a cooling
+       * account while a healthy one was sitting right there — silently breaking
+       * the promise "a cooling account is never chosen while a healthy one
+       * exists".
+       *
+       * The wider rule: a band is only tried when every earlier band is EMPTY.
+       * That keeps the truthful error intact — "every account is cooling for this
+       * model" must stay a 429 answered without touching the transport, not a
+       * round trip that comes back 502. Resilience is a last resort, not a
+       * preference, and a pool where nothing is ready has already told the caller
+       * exactly what is wrong.
+       */
+      const stages = bands.ready.length > 0 ? [bands.ready] : []
+      if (stages.length === 0) {
+        // Nothing ready. Resting accounts are a rejected sign-in, which retrying
+        // cannot fix, so they are never auto-tried; a model-level cooldown is the
+        // one case where a single attempt is still worth making, because the model
+        // may answer on a different account that merely has not recovered yet.
+        return undefined
+      }
+
+      // An explicit pick wins outright when it is eligible. Reordering the list
+      // is not enough now that priority mode draws by weight: the user asked for
+      // one account, so the draw should not be able to pick another.
+      //
+      // "Eligible" is answered by the READY band, not by the raw account list. A
+      // pin is a preference between accounts that can serve the request, never a
+      // licence to spend one that is cooling, resting, switched off, or below the
+      // balance floor the user reserved — the card's own copy says exactly that
+      // ("try this first", not "only ever use this one").
+      if (this.preferredAccountId !== undefined) {
+        const preferred = bands.ready.find(account => account.id === this.preferredAccountId)
+        if (preferred !== undefined && await this.ensureFresh(preferred)) return preferred
+      }
+
+      if (this.distribution === 'sticky') {
+        const bound = this.affinityAccount(bands.ready, conversationKey)
+        if (bound !== undefined && await this.ensureFresh(bound)) return bound
+      }
+
+      /**
+       * An account whose balance has never been read goes first, ONCE — but only
+       * under `priority`.
+       *
+       * The reasoning is `priority`-specific: that mode drains one account at a
+       * time, so a fresh account appended to the pool would sit untouched behind an
+       * account that is nearly spent, and the pool would never learn what the new
+       * one has. Trying it once makes its own answer fill in the blank.
+       *
+       * `round-robin`, `balanced`, `sticky` and `expiry` already reach a new
+       * account by their own rule — the cursor walks to it, the weight draw will
+       * eventually pick it, a new conversation moves on to it — so jumping the
+       * queue here would not add information, it would only override the
+       * distribution the user chose. That was a real regression: it pinned every
+       * rotation to the first unprobed account.
+       *
+       * Restricted to `ready` as well: an account that is cooling is not made more
+       * attractive by being unknown, and probing it would spend a request to learn
+       * a number that does not change whether it can answer.
+       */
+      const probe = this.distribution === 'priority' && bands.ready.length > 1
+        ? bands.ready.find(account => !this.creditBalances.has(account.id))
+        : undefined
+      if (probe !== undefined && this.isStageEligible(probe, bands)) {
+        if (await this.ensureFresh(probe)) return probe
+      }
+
+      // Try each band as its own pool, in order.
+      for (const pool of stages) {
+        // `priority` keeps the original behaviour: the head of the ordered list
+        // answers until it is limited, which is what a pool of your own accounts
+        // is for. `round-robin` walks the cursor, and so does a NEW `sticky`
+        // conversation, which is what makes consecutive new chats land on
+        // consecutive accounts. `balanced` draws by weight so a quiet pool spreads
+        // across accounts instead of draining the first one. `expiry` spends the
+        // packs that are about to die before they do.
+        const account = this.distribution === 'round-robin' || this.distribution === 'sticky'
+          ? this.pickRoundRobin(pool)
+          : this.distribution === 'balanced'
+            ? this.pickByWeight(pool)
+            : this.distribution === 'expiry'
+              ? this.pickByExpiry(pool)
+              : pool[0]
+        // Serving is recorded by noteServed once the upstream answers 200, not
+        // here: picking only says which account is being tried, and the shim may
+        // still rotate before the request succeeds.
+        if (account === undefined) continue
+        const healthy = await this.ensureFresh(account)
+        if (!healthy) continue
+        if (this.distribution === 'sticky' && conversationKey !== undefined && conversationKey !== '') {
+          this.bindAffinity(conversationKey, account.id)
+        }
+        return account
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Whether an account belongs to a band that is currently in play.
+   *
+   * Only `ready` accounts are eligible for the probe shortcut: picking a resting
+   * account ahead of a healthy one is the very thing the bands exist to prevent.
+   */
+  private isStageEligible(account: WorkBuddyAccount, bands: { ready: readonly WorkBuddyAccount[] }): boolean {
+    return bands.ready.includes(account)
+  }
+
+  /** How the pool currently spreads requests. Shown on the card. */
+  currentDistribution(): AccountDistribution {
+    return this.distribution
+  }
+
+  /**
+   * The account the user asked to be tried first, whatever the distribution says.
+   *
+   * Pins identity, not the credential: the account still has to pass every gate
+   * the strategy applies (fresh token, out of cooldown, above its credit reserve,
+   * not switched off), and when it fails one of them the pool falls back to the
+   * strategy untouched. That is the whole promise — "try this first", never "only
+   * ever use this one" — and it is why a stale pin is harmless.
+   *
+   * Returns undefined when nothing is pinned, which is also how the user undoes a
+   * pin. The value survives {@link WorkBuddyPool.scan}, because a rescan discovers
+   * accounts and must not quietly revise a choice the user made about one of them.
+   */
+  prefer(accountId: string | undefined): void {
+    this.preferredAccountId = accountId
+  }
+
+  /**
+   * Which account is pinned, for the card and the status document.
+   *
+   * A reader is required rather than optional politeness: without one the status
+   * document would have to report a preference it cannot see, and the only
+   * truthful way to render "you asked for this one" on a row is to ask the pool.
+   * Callers that need to know whether the pin is still *live* (pinned AND present
+   * in the pool) must do that presence check themselves — this answers "what did
+   * the user choose", not "is it usable right now".
+   */
+  preferredId(): string | undefined {
+    return this.preferredAccountId
+  }
+
+  /** Whether the user switched this account off on the card. */
+  isDisabled(accountId: string): boolean {
+    return this.disabledIds.has(accountId)
+  }
+
+  /** Every account id the user switched off, in discovery order. */
+  disabledIdsInOrder(): string[] {
+    return this.accounts.filter(account => this.disabledIds.has(account.id)).map(account => account.id)
+  }
+
+  /**
+   * Record that an account actually served a request.
+   *
+   * Called by the shim once the upstream answers 200 — only then is the account
+   * the one the user is really being served by. `balanced` mode reads the same map
+   * for its idle weighting, so a request that failed over to another account must
+   * not count as used for the account that was merely tried.
+   */
+  noteServed(accountId: string): void {
+    if (!this.accounts.some(account => account.id === accountId)) return
+    this.lastUsedAt.set(accountId, Date.now())
+  }
+
+  /**
+   * Record an account latest known credit balance.
+   *
+   * Called after a request and by the card balance refresh, so the reserve
+   * check has something to compare against. A reading for an unknown account is
+   * dropped: `scan()` rebuilds the account list and a stale id would otherwise
+   * accumulate forever.
+   *
+   * `nearestExpiryMs` is the same reading's nearest one-off pack deadline, or
+   * undefined when nothing is about to expire. It is written through, not
+   * merged: a pack that has been spent or has died disappears from the next
+   * reading, and keeping the stale deadline would pin the pool to an account
+   * whose credits are already gone — the opposite of what `expiry` mode wants.
+   *
+   * "Nothing expires" is a real answer, not the absence of one: it is stored as
+   * {@link creditExpiryNone} so the account is not read again on every pass.
+   */
+  noteCredits(accountId: string, balance: number, nearestExpiryMs?: number): void {
+    if (!Number.isFinite(balance)) return
+    if (!this.accounts.some(account => account.id === accountId)) return
+    this.creditBalances.set(accountId, balance)
+    this.noteExpiryReading(accountId, nearestExpiryMs)
+  }
+
+  /**
+   * Record ONLY the deadline, never the balance.
+   *
+   * The scan-triggered warm exists to fill `expiry` mode's sort key. Writing the
+   * balance as a side effect would change what the reserve floor decides — an
+   * account could be pulled out of rotation by a background read the user never
+   * asked for, which is a behaviour change outside this fix's scope (S7 in
+   * `EXPIRY-ADVERSARIAL-20261111.md`; the reserve's own cold-start hole is V4,
+   * fixed separately).
+   */
+  noteExpiryOnly(accountId: string, nearestExpiryMs?: number): void {
+    if (!this.accounts.some(account => account.id === accountId)) return
+    this.noteExpiryReading(accountId, nearestExpiryMs)
+  }
+
+  /**
+   * The three-state writer both entry points funnel through.
+   *
+   * One place, so the invariant "a finished reading always leaves a state" can be
+   * read off a single function: either a deadline is stored, or the account joins
+   * `creditExpiryNone`. Nothing here deletes the read stamp — that is what makes
+   * "read, found nothing" distinguishable from "never read".
+   */
+  private noteExpiryReading(accountId: string, nearestExpiryMs: number | undefined): void {
+    this.creditExpiryReadAt.set(accountId, Date.now())
+    if (nearestExpiryMs === undefined || !Number.isFinite(nearestExpiryMs)) {
+      this.creditExpiry.delete(accountId)
+      this.creditExpiryNone.add(accountId)
+      return
+    }
+    this.creditExpiryNone.delete(accountId)
+    this.creditExpiry.set(accountId, nearestExpiryMs)
+  }
+
+  /** Nearest one-off pack expiry for one account, or undefined when none known. */
+  creditExpiryOf(accountId: string): number | undefined {
+    return this.creditExpiry.get(accountId)
+  }
+
+  /**
+   * The full three-state reading for one account, including staleness.
+   *
+   * `stale` is evaluated against {@link EXPIRY_READING_TTL_MS} here rather than
+   * baked into the stored value, so the TTL stays a constant of the policy and
+   * not of the data.
+   *
+   * Only a real deadline can go stale. "We never asked" is not a reading, and
+   * "nothing here has a deadline" does not become less true with age: a monthly
+   * pack does not grow an expiry date by waiting. Keeping `none` permanently
+   * valid is what makes the S1 loop impossible — an account that answered once
+   * is never read again by the expiry machinery, so there is no predicate that
+   * can stay true forever and re-read it on every pass. If such an account does
+   * gain a one-off pack later, the card refresh (which writes through
+   * `noteCredits` on every poll) is what notices.
+   */
+  expiryReadingOf(accountId: string, now = Date.now()): ExpiryReading {
+    const at = this.creditExpiry.get(accountId)
+    const readAtMs = this.creditExpiryReadAt.get(accountId)
+    if (readAtMs === undefined) return { state: 'unread', stale: false }
+    if (at !== undefined) return { state: 'at', at, readAtMs, stale: now - readAtMs > this.expiryReadingTtlMs }
+    if (this.creditExpiryNone.has(accountId)) return { state: 'none', readAtMs, stale: false }
+    // A read stamp with neither answer should not happen; treat it as unread
+    // rather than inventing a deadline or claiming there is none.
+    return { state: 'unread', stale: false }
+  }
+
+  /** Last known balance for one account, or undefined when never read. */
+  creditsOf(accountId: string): number | undefined {
+    return this.creditBalances.get(accountId)
+  }
+
+  /** The credit floor the user set for one account; 0 when unset. */
+  creditReserveOf(accountId: string): number {
+    return this.creditReserves.get(accountId) ?? 0
+  }
+
+  /**
+   * Replace every reserve. Called from settings on each apply, so the map
+   * mirrors the saved document exactly instead of accumulating old keys.
+   */
+  setCreditReserves(reserves: Readonly<Record<string, number>>): void {
+    const next = new Map<string, number>()
+    for (const [id, value] of Object.entries(reserves)) {
+      if (Number.isFinite(value) && value > 0) next.set(id, Math.floor(value))
+    }
+    this.creditReserves = next
+  }
+
+  /** Every reserve currently in force, keyed by account id. */
+  creditReservesInOrder(): Record<string, number> {
+    const out: Record<string, number> = {}
+    for (const account of this.accounts) {
+      const reserve = this.creditReserves.get(account.id)
+      if (reserve !== undefined && reserve > 0) out[account.id] = reserve
+    }
+    return out
+  }
+
+  /**
+   * Whether an account is held back only by its reserve.
+   *
+   * Separates "resting to protect credits" from every other reason an account
+   * is out of rotation, which is what the card shows the user.
+   */
+  isReserved(accountId: string): boolean {
+    const reserve = this.creditReserves.get(accountId)
+    if (reserve === undefined || reserve <= 0) return false
+    const balance = this.creditBalances.get(accountId)
+    return balance !== undefined && balance <= reserve
+  }
+
+  /**
+   * The account that served the most recent request, if any.
+   *
+   * Distinct from "who would serve the next one": this is a record of what
+   * actually happened, which is what the card needs to answer "which account am
+   * I using right now?". Under `balanced` there is no deterministic next account
+   * at all, so a recorded fact is the only honest answer.
+   *
+   * Returns undefined before the first request of the process, and after every
+   * known account has been re-scanned away (a login swapped out under us).
+   */
+  lastServedId(): string | undefined {
+    let newest: { id: string; at: number } | undefined
+    for (const [id, at] of this.lastUsedAt) {
+      if (!this.accounts.some(account => account.id === id)) continue
+      if (newest === undefined || at > newest.at) newest = { id, at }
+    }
+    return newest?.id
+  }
+
+  /** Best-effort refresh of one account after a session-dead upstream answer. */
+  async refreshAccount(accountId: string, options?: { force?: boolean }): Promise<boolean> {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return false
+    return await this.ensureFresh(account, options?.force === true)
+  }
+
+  /**
+   * Cool a whole account because the upstream REJECTED its sign-in (401/403).
+   *
+   * Called with direct evidence (the request just came back `session_dead`), so
+   * it does not need to guess: without this, the next retry of the SAME request
+   * picks the same account again — its credential file still claims to be valid
+   * — and a request with 8 attempts spends all 8 on one dead account while
+   * healthy accounts are never tried.
+   */
+  penalizeCredentialDead(accountId: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    const until = Date.now() + this.credentialDeadCooldownMs
+    account.credentialDeadUntilMs = Math.max(account.credentialDeadUntilMs ?? 0, until)
+    this.logger?.warn(
+      `dsh-xdpool: ${account.label} sign-in was rejected by the upstream; `
+        + `keeping it out of rotation until ${new Date(until).toISOString()} (sign in again to restore it)`,
+    )
+  }
+
+  /** Put an account back in rotation after its sign-in was proven good again. */
+  clearCredentialDead(accountId: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    account.credentialDeadUntilMs = 0
+  }
+
+  /** Accounts currently kept out of rotation because their sign-in was rejected. */
+  deadCredentials(): readonly WorkBuddyAccount[] {
+    const now = Date.now()
+    return this.accounts.filter(account => (account.credentialDeadUntilMs ?? 0) > now)
+  }
+
+  /**
+   * Try to bring benched accounts back WITHOUT waiting out the cooldown.
+   *
+   * The cooldown is a guess about how long a problem lasts, and the guess is
+   * usually wrong in one direction or the other: a token revoked by a password
+   * change stays dead for the full window even after the user signs in again in
+   * some other client, and a transient upstream hiccup benches a perfectly good
+   * account for half an hour.
+   *
+   * So instead of only waiting, ask. For each benched account, one cheap
+   * authenticated read: if it answers, the credential works and the account goes
+   * back into rotation immediately. Nothing about the failure is trusted — only a
+   * successful call clears it — and a probe that fails keeps the original
+   * cooldown untouched (probing must never EXTEND a bench, or a broken endpoint
+   * would keep every account locked out for as long as it stayed broken).
+   *
+   * `probe` is injected rather than imported so this class stays free of the
+   * upstream client: the pool knows about accounts, not about HTTP.
+   *
+   * Returns the accounts it revived, for logging and for the run summary.
+   */
+  async reviveBenched(
+    probe: (credential: WorkBuddyCredential) => Promise<unknown>,
+  ): Promise<readonly WorkBuddyAccount[]> {
+    const benched = this.deadCredentials()
+    if (benched.length === 0) return []
+    const revived: WorkBuddyAccount[] = []
+    for (const account of benched) {
+      try {
+        await probe(account.credential)
+      } catch {
+        // Still bad. Leave `credentialDeadUntilMs` exactly as it was: a failed
+        // probe is not evidence of anything new, and shortening or extending the
+        // bench on it would make the cooldown depend on how often we probe.
+        continue
+      }
+      this.clearCredentialDead(account.id)
+      revived.push(account)
+      this.logger?.info?.(
+        `dsh-xdpool: ${account.label} answered a probe; back in rotation without waiting out the cooldown`,
+      )
+    }
+    return revived
+  }
+
+  /**
+   * Refresh the account's access token when it is within the margin (or already
+   * expired), in-flight de-duped per account. A failed refresh keeps the
+   * existing token when it has not yet expired, so an unreachable refresh
+   * endpoint never takes down a working session.
+   *
+   * `force` skips the "is it expiring?" gate. That gate is a cost optimisation,
+   * not a correctness rule: it exists so a healthy token is not re-fetched on
+   * every acquire. After the upstream has ALREADY rejected the token, the gate
+   * is actively wrong — a revoked token keeps its future `expiresAtMs` — and the
+   * caller needs the refresh attempted so the credential can be proven dead.
+   *
+   * Returns true when the token is known good afterwards (refreshed, or still
+   * valid), false when the credential was proven dead.
+   */
+  private async ensureFresh(account: WorkBuddyAccount, force = false): Promise<boolean> {
+    if (this.client === undefined) return true
+    const credential = account.credential
+    const expiring = credential.expiresAtMs <= 0 || credential.expiresAtMs <= Date.now() + this.refreshMarginMs
+    if (!expiring && !force) return true
+    const existing = this.refreshInflight.get(account.id)
+    if (existing !== undefined) {
+      await existing
+      return (account.credentialDeadUntilMs ?? 0) <= Date.now()
+    }
+    const run = (async (): Promise<boolean> => {
+      if (credential.refreshToken === '') {
+        // Nothing to refresh with; only worth failing if already expired.
+        if (credential.expiresAtMs > Date.now() + 30_000) return true
+        this.logger?.warn(`dsh-xdpool: ${account.label} token expired with no refresh token; sign in again`)
+        this.penalizeCredentialDead(account.id)
+        return false
+      }
+      try {
+        const outcome = await this.client!.refreshToken(credential)
+        account.credential = {
+          ...credential,
+          accessToken: outcome.accessToken,
+          ...outcome.refreshToken === undefined ? {} : { refreshToken: outcome.refreshToken },
+          expiresAtMs: outcome.expiresInSec !== undefined
+            ? Date.now() + outcome.expiresInSec * 1000
+            : credential.expiresAtMs,
+          ...outcome.domain === undefined || outcome.domain === '' ? {} : { domain: outcome.domain },
+        }
+        // A working refresh is the strongest possible proof the sign-in is
+        // alive again — undo any earlier dead mark.
+        this.clearCredentialDead(account.id)
+        this.logger?.info?.(`dsh-xdpool: refreshed token for ${account.label}`)
+        return true
+      } catch (error: unknown) {
+        if (isCredentialDeadError(error)) {
+          // The upstream said the refresh token itself is gone
+          // (`invalid_grant: Offline user session not found`). The stored expiry
+          // is meaningless here — it stays in the future for a revoked token —
+          // so mark the account dead instead of retrying it forever.
+          this.penalizeCredentialDead(account.id)
+          this.logger?.warn?.(
+            `dsh-xdpool: ${account.label} refresh token was revoked upstream; sign in again to restore it`,
+            error,
+          )
+          return false
+        }
+        if (credential.expiresAtMs > Date.now() + 30_000) {
+          this.logger?.warn?.(`dsh-xdpool: token refresh failed but token still valid for ${account.label}`, error)
+        } else {
+          this.logger?.error?.(`dsh-xdpool: token refresh failed and token expired for ${account.label}`, error)
+        }
+        return true
+      }
+    })()
+    this.refreshInflight.set(account.id, run)
+    try {
+      return await run
+    } finally {
+      this.refreshInflight.delete(account.id)
+    }
+  }
+
+  /**
+   * Cool a whole account after the upstream reports its credits are spent.
+   *
+   * Credit exhaustion is an ACCOUNT condition, unlike a model rate limit: every
+   * model on that account is unusable until the quota resets, so this cools the
+   * account as a whole (no `modelId`) for the configured exhaustion window. The
+   * shim then rotates to a different account instead of failing the request.
+   */
+  penalizeExhausted(accountId: string): void {
+    const until = Date.now() + this.exhaustCooldownMs
+    this.penalize(accountId, until)
+    this.logger?.warn(
+      
+`
+dsh-xdpool: account credits exhausted; cooling the whole account until 
+`
+ +
+        
+`
+${new Date(until).toISOString()}
+`
+,
+    )
+  }
+
+  /**
+   * Mark an account (or one of its models) rate-limited.
+   *
+   * With `modelId`, only that model on the account is cooled — the account's
+   * other models stay in rotation, matching the upstream's per-model rate
+   * limit ("可切换其他模型继续使用"). Without a model id the whole account is
+   * cooled, which callers should reserve for limits that truly span every model.
+   */
+  penalize(accountId: string, resetAtMs?: number, modelId?: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    account.rateLimitHits += 1
+    const until = resetAtMs ?? Date.now() + this.cooldownMs
+    if (modelId !== undefined && modelId !== '') {
+      account.modelCooldowns[modelId] = Math.max(account.modelCooldowns[modelId] ?? 0, until)
+      this.logger?.warn(
+        `dsh-xdpool: ${account.label} rate-limited on model ${modelId}; ` +
+          `cooling that model until ${new Date(until).toISOString()}`,
+      )
+      return
+    }
+    account.cooldownUntilMs = Math.max(account.cooldownUntilMs, until)
+    this.logger?.warn(
+      `dsh-xdpool: account ${account.label} rate-limited; cooling until ${new Date(until).toISOString()}`,
+    )
+  }
+
+  /** Clear all cooldowns (account-wide and per-model), e.g. from a reset command. */
+  resetCooldowns(): void {
+    for (const account of this.accounts) {
+      account.cooldownUntilMs = 0
+      account.modelCooldowns = {}
+      account.rateLimitHits = 0
+      // A rejected sign-in is a cooldown too, and "clear all cooldowns" is the
+      // user saying "try everything again". If the credential really is dead the
+      // next request re-marks it, so the cost of clearing is one failed attempt
+      // and the benefit is that a working account is never hidden by a stale mark.
+      account.credentialDeadUntilMs = 0
+    }
+  }
+
+  /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:
+   *  the account as a whole stays usable when only one model is limited). */
+  status(): { count: number; cooling: number; dead: number; lastScanAtMs: number } {
+    const now = Date.now()
+    return {
+      count: this.accounts.length,
+      cooling: this.accounts.filter(account => account.cooldownUntilMs > now).length,
+      dead: this.accounts.filter(account => (account.credentialDeadUntilMs ?? 0) > now).length,
+      lastScanAtMs: this.lastScanAtMs,
+    }
+  }
+}

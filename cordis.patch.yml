@@ -1,0 +1,24 @@
+# Register the XD Pool provider. Discovery is read-only: the plugin reuses the
+# WorkBuddy desktop app's own sign-in files and never starts a separate OAuth
+# flow. Requests rotate across every discovered account.
+- insert:
+    - id: llm-xdpool
+      name: dsh-xdpool
+#
+# billion-context is gone from this plugin, and so is the row that used to sit
+# here (`billion-context-xdpool`, kept disabled).
+#
+# 2.0.0 inserted that row so a profile without the compressor would get one for
+# free. Measured against a profile that had ALREADY installed billion-context —
+# the normal state for anyone using it, since `bili-native` comes from that
+# plugin's own `dsh.bundle.patch.yml` — the host did not disable the duplicate
+# and did not resolve it to a no-op: it ran the fiber to `failed`, because the
+# plugin registers a cordis service under its own name and a second registration
+# is refused outright (`service "…" has been registered at <…>`). Every user who
+# had installed it got a permanently failed entry, unexplained, pointing at us.
+#
+# The follow-up kept the row, disabled, "for addressability". That was the wrong
+# trade: it left a name in this file for a feature the plugin no longer has, and
+# the page that read it (`billion-context`) is deleted too. Installing the
+# compressor is its own decision, made by installing it — which is the
+# arrangement that always worked.
